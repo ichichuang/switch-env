@@ -1,0 +1,1406 @@
+#!/usr/bin/env python3
+"""switch-env: 统一的多运行时环境自动化引擎。
+
+聚合 Python (pyenv/conda) 与 Node.js (nvm) 的版本管理，提供：
+  - 单一 chpwd 入口（供未来 zsh 插件调用）
+  - 语义版本宽泛比对（v18.20.7 ≈ 18）
+  - 去激活 / 回退逻辑
+  - 统一的 IPC 协议（__SWITCH_ENV_CMD__:<shell_cmd>）
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
+
+console = Console()
+
+# ─── 常量 ────────────────────────────────────────────────────────────────────
+
+DEFAULT_VENV_NAME = ".venv"
+PROJECT_ENV_FILE = ".switch-py-env"       # 兼容旧 switch-py
+PROJECT_UNIFIED_FILE = ".switch-env"      # 新统一配置
+PROJECT_CACHE_DIR = ".switch-py-cache"
+PROJECT_HASH_LOCK = "hash.lock"
+
+PYENV_CMD = "pyenv"
+CONDA_CMD = "conda"
+
+IPC_PREFIX = "__SWITCH_ENV_CMD__"          # zsh 插件 eval 协议
+LEGACY_IPC_PREFIX = "__SWITCH_PY_ACTIVATE_CMD__"  # 向后兼容
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / errors & logging
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SwitchEnvError(RuntimeError):
+    pass
+
+
+class ShellError(SwitchEnvError):
+    def __init__(self, cmd: str, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        super().__init__(f"命令失败 (code={returncode}): {cmd}")
+        self.cmd, self.returncode, self.stdout, self.stderr = cmd, returncode, stdout, stderr
+
+
+class Logger:
+    def __init__(self, con: Console, verbose: bool = False) -> None:
+        self._c = con
+        self._verbose = verbose
+
+    def info(self, msg: str) -> None:
+        self._c.print(f"[cyan]INFO[/cyan]  {msg}")
+
+    def warn(self, msg: str) -> None:
+        self._c.print(f"[yellow]WARN[/yellow]  {msg}")
+
+    def error(self, msg: str) -> None:
+        self._c.print(f"[bold red]ERROR[/bold red] {msg}")
+
+    def success(self, msg: str) -> None:
+        self._c.print(f"[bold green]OK[/bold green]    {msg}")
+
+    def debug(self, msg: str) -> None:
+        if self._verbose:
+            self._c.print(f"[dim]DEBUG[/dim] {msg}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / shell runner
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class ShellResult:
+    cmd: str
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class ShellRunner:
+    def __init__(self, logger: Logger, dry_run: bool = False) -> None:
+        self._log = logger
+        self._dry_run = dry_run
+
+    @property
+    def dry_run(self) -> bool:
+        return self._dry_run
+
+    def which(self, prog: str) -> Optional[str]:
+        return shutil.which(prog)
+
+    def run(
+        self,
+        cmd: str,
+        *,
+        check: bool = True,
+        capture: bool = True,
+        cwd: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+        quiet: bool = False,
+    ) -> ShellResult:
+        if self._dry_run:
+            self._log.info(f"[dry-run] {cmd}")
+            return ShellResult(cmd=cmd, returncode=0, stdout="", stderr="")
+        if not quiet:
+            self._log.debug(f"$ {cmd}")
+        p = subprocess.run(
+            cmd, shell=True, cwd=str(cwd) if cwd else None,
+            env=env, capture_output=capture, text=True,
+        )
+        res = ShellResult(cmd=cmd, returncode=p.returncode, stdout=p.stdout or "", stderr=p.stderr or "")
+        if check and res.returncode != 0:
+            raise ShellError(cmd, res.returncode, res.stdout, res.stderr)
+        return res
+
+
+def shlex_quote(s: str) -> str:
+    if s == "":
+        return "''"
+    if re.fullmatch(r"[A-Za-z0-9_./:=@+-]+", s):
+        return s
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / semantic version comparison (Node.js)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class SemVer:
+    """解析后的语义版本，支持不完整版本号。"""
+    major: int
+    minor: Optional[int] = None
+    patch: Optional[int] = None
+    raw: str = ""
+
+    @staticmethod
+    def parse(raw: str) -> Optional["SemVer"]:
+        """解析 '18', 'v18', '18.20', 'v18.20.7', 'lts/hydrogen' 等。"""
+        s = raw.strip().lstrip("v").strip()
+        if not s or s.startswith("lts"):
+            return None
+        m = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?", s)
+        if not m:
+            return None
+        major = int(m.group(1))
+        minor = int(m.group(2)) if m.group(2) is not None else None
+        patch = int(m.group(3)) if m.group(3) is not None else None
+        return SemVer(major=major, minor=minor, patch=patch, raw=raw.strip())
+
+    def matches(self, other: "SemVer") -> bool:
+        """宽泛语义匹配：仅比较双方都提供的层级。
+
+        示例:
+          SemVer(18) .matches( SemVer(18, 20, 7) )  → True
+          SemVer(18, 20) .matches( SemVer(18, 20, 7) )  → True
+          SemVer(18, 20, 7) .matches( SemVer(18, 20, 7) )  → True
+          SemVer(18) .matches( SemVer(20) )  → False
+        """
+        if self.major != other.major:
+            return False
+        # 如果任一方未指定 minor，则只比 major
+        if self.minor is None or other.minor is None:
+            return True
+        if self.minor != other.minor:
+            return False
+        # 如果任一方未指定 patch，则只比到 minor
+        if self.patch is None or other.patch is None:
+            return True
+        return self.patch == other.patch
+
+    def __str__(self) -> str:
+        if self.minor is None:
+            return str(self.major)
+        if self.patch is None:
+            return f"{self.major}.{self.minor}"
+        return f"{self.major}.{self.minor}.{self.patch}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / config & project detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_toml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        import tomllib
+    except Exception:
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    py_manager: str = "pyenv"        # pyenv | conda | auto
+    node_manager: str = "nvm"        # nvm (将来可扩展 fnm/volta)
+    auto_install: bool = True
+    auto_activate: bool = True
+    prefer: str = "venv"             # venv | conda
+    lazy_activate: bool = True
+
+    @staticmethod
+    def load(home: Path) -> "AppConfig":
+        # 优先读 .switch-env/config.toml，兼容 .switch-py/config.toml
+        for name in (".switch-env", ".switch-py"):
+            data = _load_toml(home / name / "config.toml")
+            if data:
+                d = data.get("default", {}) if isinstance(data, dict) else {}
+                return AppConfig(
+                    py_manager=str(d.get("manager", d.get("py_manager", "pyenv"))),
+                    node_manager=str(d.get("node_manager", "nvm")),
+                    auto_install=bool(d.get("auto_install", True)),
+                    auto_activate=bool(d.get("auto_activate", True)),
+                    prefer=str(d.get("prefer", "venv")),
+                    lazy_activate=bool(d.get("lazy_activate", True)),
+                )
+        return AppConfig()
+
+
+@dataclass(frozen=True)
+class ProjectSpec:
+    root: Path
+    kind: str                          # pip | poetry | pdm | conda | pyproject | unknown
+    requirements: Optional[Path] = None
+    pyproject: Optional[Path] = None
+    environment_yml: Optional[Path] = None
+    has_nvmrc: bool = False
+    has_node_version: bool = False
+    nvmrc_path: Optional[Path] = None
+    node_version_path: Optional[Path] = None
+    has_python_version: bool = False
+
+
+def detect_project(root: Path) -> ProjectSpec:
+    req = root / "requirements.txt"
+    pyproject = root / "pyproject.toml"
+    envy = root / "environment.yml"
+    nvmrc = root / ".nvmrc"
+    nodev = root / ".node-version"
+    pyver = root / ".python-version"
+
+    # Python 项目类型
+    kind = "unknown"
+    req_path: Optional[Path] = None
+    pp_path: Optional[Path] = None
+    env_path: Optional[Path] = None
+
+    if envy.exists():
+        kind, env_path = "conda", envy
+    elif req.exists():
+        kind, req_path = "pip", req
+    elif pyproject.exists():
+        txt = pyproject.read_text(encoding="utf-8", errors="ignore")
+        if re.search(r"(?m)^\s*\[tool\.poetry\]", txt):
+            kind, pp_path = "poetry", pyproject
+        elif re.search(r"(?m)^\s*\[tool\.pdm\]", txt):
+            kind, pp_path = "pdm", pyproject
+        else:
+            kind, pp_path = "pyproject", pyproject
+
+    return ProjectSpec(
+        root=root, kind=kind,
+        requirements=req_path, pyproject=pp_path, environment_yml=env_path,
+        has_nvmrc=nvmrc.exists(),
+        has_node_version=nodev.exists(),
+        nvmrc_path=nvmrc if nvmrc.exists() else None,
+        node_version_path=nodev if nodev.exists() else None,
+        has_python_version=pyver.exists(),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / dependency cache
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_deps_fingerprint(spec: ProjectSpec) -> str:
+    parts: List[Tuple[str, bytes]] = []
+    if spec.requirements and spec.requirements.exists():
+        parts.append(("requirements.txt", spec.requirements.read_bytes()))
+    if spec.pyproject and spec.pyproject.exists():
+        parts.append(("pyproject.toml", spec.pyproject.read_bytes()))
+    if spec.environment_yml and spec.environment_yml.exists():
+        parts.append(("environment.yml", spec.environment_yml.read_bytes()))
+    joined = b"\n".join(name.encode() + b"\0" + content for name, content in parts)
+    return hashlib.sha256(joined).hexdigest()
+
+
+class CacheStore:
+    def __init__(self, project_root: Path, logger: Logger) -> None:
+        self.root = project_root / PROJECT_CACHE_DIR
+        self.lock = self.root / PROJECT_HASH_LOCK
+        self._log = logger
+
+    def read_fingerprint(self) -> Optional[str]:
+        try:
+            return self.lock.read_text(encoding="utf-8").strip() or None if self.lock.exists() else None
+        except Exception:
+            return None
+
+    def write_fingerprint(self, fp: str, dry_run: bool) -> None:
+        if dry_run:
+            self._log.info(f"[dry-run] 写入缓存指纹 {self.lock}")
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock.write_text(fp + "\n", encoding="utf-8")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  managers / Strategy ABC
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class ActivatePlan:
+    """一条或多条需要在调用方 shell 里 eval 的命令。"""
+    kind: str                      # shell_cmd | noop
+    shell_cmds: List[str] = field(default_factory=list)
+
+
+class EnvironmentManager(ABC):
+    def __init__(self, shell: ShellRunner, logger: Logger) -> None:
+        self.shell = shell
+        self.log = logger
+
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @abstractmethod
+    def is_available(self) -> bool: ...
+
+
+class PythonManager(EnvironmentManager):
+    """Python 侧管理器的公共接口。"""
+
+    @abstractmethod
+    def ensure_python(self, version: str, interactive: bool) -> None: ...
+
+    @abstractmethod
+    def set_project_python(self, project_root: Path, version: str, scope: str) -> None: ...
+
+    @abstractmethod
+    def create_or_get_venv(self, project_root: Path, venv_name: str) -> Path: ...
+
+    @abstractmethod
+    def install_deps(self, spec: ProjectSpec, venv_path: Optional[Path], cache: CacheStore, interactive: bool) -> None: ...
+
+    @abstractmethod
+    def activation_plan(self, project_root: Path, venv_path: Optional[Path], env_ref: str) -> ActivatePlan: ...
+
+    @abstractmethod
+    def deactivation_plan(self) -> ActivatePlan: ...
+
+
+class NodeManager(EnvironmentManager):
+    """Node.js 侧管理器的公共接口。"""
+
+    @abstractmethod
+    def current_version(self) -> Optional[SemVer]: ...
+
+    @abstractmethod
+    def requested_version(self, spec: ProjectSpec) -> Optional[SemVer]: ...
+
+    @abstractmethod
+    def ensure_node(self, version: str, interactive: bool) -> None: ...
+
+    @abstractmethod
+    def switch_plan(self, requested: str) -> ActivatePlan: ...
+
+    @abstractmethod
+    def deactivation_plan(self) -> ActivatePlan: ...
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  managers / PyenvManager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PyenvManager(PythonManager):
+    def name(self) -> str:
+        return "pyenv"
+
+    def is_available(self) -> bool:
+        return self.shell.which(PYENV_CMD) is not None
+
+    def ensure_python(self, version: str, interactive: bool) -> None:
+        if not self.is_available():
+            raise SwitchEnvError("未检测到 pyenv，请先安装或在 config.toml 中改用 conda。")
+        res = self.shell.run(f"{PYENV_CMD} versions --bare", check=False)
+        installed = {line.strip() for line in res.stdout.splitlines() if line.strip()}
+        if version in installed or version == "system":
+            return
+        self.log.info(f"缺失 Python {version}，通过 pyenv 安装...")
+        self.shell.run(f"{PYENV_CMD} install -s {version}", check=True)
+
+    def set_project_python(self, project_root: Path, version: str, scope: str) -> None:
+        if scope == "global":
+            self.shell.run(f"{PYENV_CMD} global {version}")
+        else:
+            self.shell.run(f"{PYENV_CMD} local {version}", cwd=project_root)
+
+    def create_or_get_venv(self, project_root: Path, venv_name: str) -> Path:
+        venv_path = project_root / venv_name
+        if (venv_path / "bin" / "python").exists() or (venv_path / "Scripts" / "python.exe").exists():
+            return venv_path
+        self.shell.run(f"python -m venv {shlex_quote(venv_name)}", cwd=project_root)
+        return venv_path
+
+    def install_deps(self, spec: ProjectSpec, venv_path: Optional[Path], cache: CacheStore, interactive: bool) -> None:
+        fp = compute_deps_fingerprint(spec)
+        if cache.read_fingerprint() == fp:
+            self.log.success("依赖未变化（命中缓存），跳过安装。")
+            return
+
+        if spec.kind == "pip" and spec.requirements:
+            if not venv_path:
+                raise SwitchEnvError("pip 项目需要虚拟环境路径。")
+            pip_bin = _resolve_pip_bin(venv_path)
+            self.shell.run(f"{pip_bin} install -r {shlex_quote(str(spec.requirements))}", cwd=spec.root)
+        elif spec.kind in ("poetry", "pyproject"):
+            if self.shell.which("poetry"):
+                self.shell.run("poetry install", cwd=spec.root)
+            elif self.shell.which("pdm"):
+                self.shell.run("pdm install", cwd=spec.root)
+            elif spec.requirements and venv_path:
+                pip_bin = _resolve_pip_bin(venv_path)
+                self.shell.run(f"{pip_bin} install -r {shlex_quote(str(spec.requirements))}", cwd=spec.root)
+            else:
+                raise SwitchEnvError("未检测到 poetry/pdm，且缺少 requirements.txt。")
+        else:
+            self.log.warn("未识别的项目依赖类型，跳过安装。")
+            return
+
+        cache.write_fingerprint(fp, self.shell.dry_run)
+
+    def activation_plan(self, project_root: Path, venv_path: Optional[Path], env_ref: str) -> ActivatePlan:
+        if venv_path:
+            act = venv_path / "bin" / "activate"
+            if platform.system().lower().startswith("win"):
+                act = venv_path / "Scripts" / "activate"
+            return ActivatePlan(kind="shell_cmd", shell_cmds=[f"source {shlex_quote(str(act))}"])
+        return ActivatePlan(kind="noop")
+
+    def deactivation_plan(self) -> ActivatePlan:
+        return ActivatePlan(kind="shell_cmd", shell_cmds=[
+            "if type deactivate >/dev/null 2>&1; then deactivate; fi",
+        ])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  managers / CondaManager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CondaManager(PythonManager):
+    def name(self) -> str:
+        return "conda"
+
+    def is_available(self) -> bool:
+        return self.shell.which(CONDA_CMD) is not None
+
+    def ensure_python(self, version: str, interactive: bool) -> None:
+        if not self.is_available():
+            raise SwitchEnvError("未检测到 conda。")
+
+    def set_project_python(self, project_root: Path, version: str, scope: str) -> None:
+        pass  # conda 不使用 pyenv local/global
+
+    def create_or_get_venv(self, project_root: Path, venv_name: str) -> Path:
+        return project_root / venv_name
+
+    def install_deps(self, spec: ProjectSpec, venv_path: Optional[Path], cache: CacheStore, interactive: bool) -> None:
+        fp = compute_deps_fingerprint(spec)
+        if cache.read_fingerprint() == fp:
+            self.log.success("依赖未变化（命中缓存），跳过安装。")
+            return
+
+        if spec.kind == "conda" and spec.environment_yml:
+            env_name = _parse_conda_env_name(spec.environment_yml) or spec.root.name
+            self.shell.run(
+                f"{CONDA_CMD} env update -n {shlex_quote(env_name)} "
+                f"-f {shlex_quote(str(spec.environment_yml))} --prune",
+                check=False, cwd=spec.root,
+            )
+            self.shell.run(
+                f"{CONDA_CMD} env create -n {shlex_quote(env_name)} "
+                f"-f {shlex_quote(str(spec.environment_yml))}",
+                check=False, cwd=spec.root,
+            )
+        elif spec.kind == "pip" and spec.requirements:
+            self.shell.run(
+                f"pip install -r {shlex_quote(str(spec.requirements))}",
+                cwd=spec.root, check=False,
+            )
+        else:
+            self.log.warn("conda 管理器下未识别依赖，跳过。")
+            return
+
+        cache.write_fingerprint(fp, self.shell.dry_run)
+
+    def activation_plan(self, project_root: Path, venv_path: Optional[Path], env_ref: str) -> ActivatePlan:
+        return ActivatePlan(kind="shell_cmd", shell_cmds=[f"conda activate {shlex_quote(env_ref)}"])
+
+    def deactivation_plan(self) -> ActivatePlan:
+        return ActivatePlan(kind="shell_cmd", shell_cmds=["conda deactivate"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  managers / NvmManager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NvmManager(NodeManager):
+    def name(self) -> str:
+        return "nvm"
+
+    def is_available(self) -> bool:
+        nvm_dir = os.environ.get("NVM_DIR", "")
+        return bool(nvm_dir) and Path(nvm_dir, "nvm.sh").exists()
+
+    def _nvm_dir(self) -> str:
+        return os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
+
+    def current_version(self) -> Optional[SemVer]:
+        """读取当前 nvm 激活的 node 版本。"""
+        node_path = self.shell.which("node")
+        if not node_path:
+            return None
+        res = self.shell.run("node --version", check=False, quiet=True)
+        if res.returncode != 0:
+            return None
+        return SemVer.parse(res.stdout.strip())
+
+    def requested_version(self, spec: ProjectSpec) -> Optional[SemVer]:
+        """从 .nvmrc 或 .node-version 读取请求的版本。"""
+        for p in (spec.nvmrc_path, spec.node_version_path):
+            if p and p.exists():
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+                # 去除注释、空白、回车
+                raw = re.sub(r"#.*", "", raw).strip()
+                if raw:
+                    return SemVer.parse(raw)
+        return None
+
+    def _list_installed(self) -> List[SemVer]:
+        """列出本地已安装的 node 版本。"""
+        nvm_dir = self._nvm_dir()
+        versions_dir = Path(nvm_dir, "versions", "node")
+        if not versions_dir.is_dir():
+            return []
+        result = []
+        for d in versions_dir.iterdir():
+            sv = SemVer.parse(d.name)
+            if sv:
+                result.append(sv)
+        return result
+
+    def _find_best_match(self, requested: SemVer) -> Optional[SemVer]:
+        """在已安装版本中找到与请求版本语义匹配的最高版本。"""
+        installed = self._list_installed()
+        matches = [v for v in installed if requested.matches(v)]
+        if not matches:
+            return None
+        # 按 major.minor.patch 降序，取最高
+        return max(matches, key=lambda v: (v.major, v.minor or 0, v.patch or 0))
+
+    def ensure_node(self, version: str, interactive: bool) -> None:
+        """确保请求的 node 版本已安装。"""
+        requested = SemVer.parse(version)
+        if not requested:
+            self.log.warn(f"无法解析 Node 版本: {version}")
+            return
+        best = self._find_best_match(requested)
+        if best:
+            self.log.debug(f"Node {version} 已有匹配安装: v{best}")
+            return
+        self.log.info(f"缺失 Node.js {version}，将通过 nvm 安装...")
+        # nvm install 通过 shell source 执行（因为 nvm 是 shell function）
+        # 此处生成安装指令，由上层 plan 输出给 zsh eval
+        # 但在 CLI 模式下可以直接 subprocess 调 bash
+        self.shell.run(
+            f'bash -c "source {shlex_quote(self._nvm_dir() + "/nvm.sh")} && nvm install {shlex_quote(version)}"',
+            check=True,
+        )
+
+    def switch_plan(self, requested: str) -> ActivatePlan:
+        """生成切换到指定 node 版本的 shell 命令。"""
+        nvm_sh = shlex_quote(self._nvm_dir() + "/nvm.sh")
+        return ActivatePlan(kind="shell_cmd", shell_cmds=[f"nvm use {shlex_quote(requested)}"])
+
+    def deactivation_plan(self) -> ActivatePlan:
+        return ActivatePlan(kind="shell_cmd", shell_cmds=["nvm use default 2>/dev/null"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / env resolution
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class ResolvedPythonEnv:
+    manager: str                       # pyenv | conda
+    python_version: Optional[str]
+    env_ref: str                       # pyenv: version string; conda: env name
+
+
+@dataclass(frozen=True)
+class ResolvedNodeEnv:
+    raw_version: str                   # 原始请求字符串 (如 "18", "v22.14.0")
+    parsed: SemVer
+
+
+def _parse_switch_py_env_file(path: Path) -> Optional[ResolvedPythonEnv]:
+    if not path.exists():
+        return None
+    manager = version = env_name = None
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if line.startswith("manager:"):
+            manager = line.split(":", 1)[1].strip()
+        elif line.startswith("version:"):
+            version = line.split(":", 1)[1].strip()
+        elif line.startswith("env_name:"):
+            env_name = line.split(":", 1)[1].strip()
+    if manager == "pyenv" and version:
+        return ResolvedPythonEnv(manager="pyenv", python_version=version, env_ref=version)
+    if manager == "conda" and env_name:
+        return ResolvedPythonEnv(manager="conda", python_version=None, env_ref=env_name)
+    return None
+
+
+def _parse_python_version_file(path: Path) -> Optional[str]:
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8", errors="ignore").strip() or None
+
+
+def _normalize_python_constraint(s: str) -> Optional[str]:
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", s)
+    return m.group(1) if m else None
+
+
+def _parse_pyproject_python(spec: ProjectSpec) -> Optional[str]:
+    if not spec.pyproject or not spec.pyproject.exists():
+        return None
+    data = _load_toml(spec.pyproject)
+    if not data:
+        return None
+    for accessor in (
+        lambda d: d.get("tool", {}).get("poetry", {}).get("dependencies", {}).get("python"),
+        lambda d: d.get("project", {}).get("requires-python"),
+    ):
+        try:
+            val = accessor(data)
+            if isinstance(val, str) and val.strip():
+                return _normalize_python_constraint(val.strip())
+        except Exception:
+            pass
+    return None
+
+
+def _parse_conda_env_name(environment_yml: Path) -> Optional[str]:
+    try:
+        for line in environment_yml.read_text(encoding="utf-8", errors="ignore").splitlines():
+            m = re.match(r"^\s*name\s*:\s*(.+?)\s*$", line)
+            if m:
+                return m.group(1).strip().strip("'\"")
+    except Exception:
+        pass
+    return None
+
+
+FALLBACK_PYTHON = "3.12"
+
+
+class EnvResolver:
+    def __init__(self, shell: ShellRunner, config: AppConfig, logger: Logger) -> None:
+        self.shell = shell
+        self.cfg = config
+        self.log = logger
+
+    def resolve_python(self, spec: ProjectSpec) -> Optional[ResolvedPythonEnv]:
+        """推断当前目录的 Python 环境。如果目录无任何 Python 标识文件则返回 None。"""
+        root = spec.root
+
+        # 1) .switch-py-env / .switch-env (显式声明)
+        for fname in (PROJECT_UNIFIED_FILE, PROJECT_ENV_FILE):
+            r = _parse_switch_py_env_file(root / fname)
+            if r:
+                return r
+
+        # 2) pyproject.toml 中的 python 约束
+        py = _parse_pyproject_python(spec)
+        if py:
+            mgr = self._default_py_manager(spec)
+            ref = py if mgr == "pyenv" else root.name
+            return ResolvedPythonEnv(manager=mgr, python_version=py, env_ref=ref)
+
+        # 3) .python-version
+        pv = _parse_python_version_file(root / ".python-version")
+        if pv:
+            return ResolvedPythonEnv(manager="pyenv", python_version=pv, env_ref=pv)
+
+        # 4) environment.yml (conda 项目)
+        if spec.kind == "conda":
+            env_name = _parse_conda_env_name(spec.environment_yml) if spec.environment_yml else root.name
+            return ResolvedPythonEnv(manager="conda", python_version=None, env_ref=env_name or root.name)
+
+        # 5) requirements.txt 存在则视为 pip 项目
+        if spec.kind == "pip":
+            return ResolvedPythonEnv(manager="pyenv", python_version=FALLBACK_PYTHON, env_ref=FALLBACK_PYTHON)
+
+        # 无 Python 标识 → 不激活
+        return None
+
+    def resolve_node(self, spec: ProjectSpec) -> Optional[ResolvedNodeEnv]:
+        """推断当前目录的 Node.js 版本需求。无标识文件则返回 None。"""
+        for p in (spec.nvmrc_path, spec.node_version_path):
+            if p and p.exists():
+                raw = re.sub(r"#.*", "", p.read_text(encoding="utf-8", errors="ignore")).strip()
+                if raw:
+                    sv = SemVer.parse(raw)
+                    if sv:
+                        return ResolvedNodeEnv(raw_version=raw, parsed=sv)
+        return None
+
+    def _default_py_manager(self, spec: ProjectSpec) -> str:
+        if self.cfg.py_manager in ("pyenv", "conda"):
+            return self.cfg.py_manager
+        return "conda" if spec.kind == "conda" else "pyenv"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_pip_bin(venv_path: Path) -> str:
+    if os.name == "nt":
+        return shlex_quote(str(venv_path / "Scripts" / "pip.exe"))
+    return shlex_quote(str(venv_path / "bin" / "pip"))
+
+
+def _write_project_env_file(project_root: Path, manager: str, env_ref: str, dry_run: bool) -> None:
+    p = project_root / PROJECT_ENV_FILE
+    content = f"manager:{manager}\n"
+    content += f"version:{env_ref}\n" if manager == "pyenv" else f"env_name:{env_ref}\n"
+    if dry_run:
+        console.print(f"[cyan]INFO[/cyan]  [dry-run] 写入 {p}:\n{content}")
+        return
+    p.write_text(content, encoding="utf-8")
+
+
+def _emit_ipc(plan: ActivatePlan) -> None:
+    """输出 IPC 协议行供 zsh 插件 eval。"""
+    if plan.kind == "shell_cmd" and plan.shell_cmds:
+        for cmd in plan.shell_cmds:
+            print(f"{IPC_PREFIX}:{cmd}")
+
+
+def _emit_legacy_ipc(plan: ActivatePlan) -> None:
+    """向后兼容旧 switch-py.plugin.zsh 的 IPC 协议。"""
+    if plan.kind == "shell_cmd" and plan.shell_cmds:
+        for cmd in plan.shell_cmds:
+            print(f"{LEGACY_IPC_PREFIX}:{cmd}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  core / utility functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def list_pyenv_versions(shell: ShellRunner) -> List[str]:
+    if not shell.which(PYENV_CMD):
+        return []
+    r = shell.run(f"{PYENV_CMD} versions --bare", check=False)
+    versions = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    if "system" not in versions:
+        versions.append("system")
+    return versions
+
+
+def list_conda_envs(shell: ShellRunner) -> List[str]:
+    if not shell.which(CONDA_CMD):
+        return []
+    r = shell.run(f"{CONDA_CMD} env list --json", check=False)
+    if not r.stdout.strip():
+        return []
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return []
+    envs: List[str] = []
+    for env_path in data.get("envs", []):
+        base = os.path.basename(env_path)
+        if base == "":
+            base = "base"
+        if base == "envs":
+            base = os.path.basename(os.path.dirname(env_path))
+        if base and base not in envs:
+            envs.append(base)
+    if "base" not in envs:
+        envs.insert(0, "base")
+    return envs
+
+
+def clean_pycache(dir_path: str) -> None:
+    count = 0
+    for root, dirs, files in os.walk(dir_path):
+        for d in dirs:
+            if d == "__pycache__":
+                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+                count += 1
+        for f in files:
+            if f.endswith(".pyc"):
+                try:
+                    os.remove(os.path.join(root, f))
+                    count += 1
+                except Exception:
+                    pass
+    console.print(f"[green]已删除约 {count} 个缓存文件/目录[/green]")
+
+
+class progress_scope:
+    def __init__(self, title: str, log: Logger) -> None:
+        self._log = log
+        self._progress: Optional[Progress] = None
+
+    def __enter__(self) -> Progress:
+        self._progress = Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            BarColumn(), TimeElapsedColumn(), console=console, transient=True,
+        )
+        self._progress.start()
+        return self._progress
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._progress:
+            self._progress.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  commands / Command pattern
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class AppContext:
+    home: Path
+    cwd: Path
+    cfg: AppConfig
+    log: Logger
+    shell: ShellRunner
+    py_managers: Dict[str, PythonManager]
+    node_managers: Dict[str, NodeManager]
+    resolver: EnvResolver
+
+
+class Command(ABC):
+    name: str
+    help: str
+
+    @abstractmethod
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int: ...
+
+
+# ─── use ──────────────────────────────────────────────────────────────────────
+
+class UseCommand(Command):
+    name = "use"
+    help = "智能切换/激活当前目录的 Python 和 Node.js 环境。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        spec = detect_project(ctx.cwd)
+        activated_something = False
+
+        # ── Python ──
+        py_resolved = ctx.resolver.resolve_python(spec)
+        if py_resolved:
+            mgr_name = args.py_manager or py_resolved.manager
+            mgr = ctx.py_managers.get(mgr_name)
+            if not mgr or not mgr.is_available():
+                ctx.log.warn(f"Python 管理器不可用: {mgr_name}")
+            else:
+                env_ref = py_resolved.env_ref
+                pyver = py_resolved.python_version
+
+                if mgr_name == "pyenv":
+                    if not pyver:
+                        pyver = FALLBACK_PYTHON
+                    if not args.no_install:
+                        mgr.ensure_python(pyver, args.interactive)
+                    scope = getattr(args, "scope", "local") or "local"
+                    mgr.set_project_python(ctx.cwd, pyver, scope)
+                    venv_path = mgr.create_or_get_venv(ctx.cwd, DEFAULT_VENV_NAME) if ctx.cfg.prefer == "venv" else None
+                else:
+                    venv_path = None
+
+                if ctx.cfg.auto_install and not args.no_install:
+                    cache = CacheStore(ctx.cwd, ctx.log)
+                    mgr.install_deps(spec, venv_path, cache, args.interactive)
+
+                if not args.no_install:
+                    _write_project_env_file(ctx.cwd, mgr_name, env_ref, ctx.shell.dry_run)
+
+                plan = mgr.activation_plan(ctx.cwd, venv_path, env_ref)
+                _emit_ipc(plan)
+                _emit_legacy_ipc(plan)
+                ctx.log.success(f"Python: manager={mgr_name}, env={env_ref}")
+                activated_something = True
+
+        # ── Node.js ──
+        node_resolved = ctx.resolver.resolve_node(spec)
+        if node_resolved:
+            nmgr = ctx.node_managers.get(ctx.cfg.node_manager)
+            if nmgr and nmgr.is_available():
+                current = nmgr.current_version()
+                requested = node_resolved.parsed
+
+                if current and requested.matches(current):
+                    ctx.log.debug(f"Node.js 已是 v{current}，匹配 {node_resolved.raw_version}，无需切换。")
+                else:
+                    if not args.no_install:
+                        nmgr.ensure_node(node_resolved.raw_version, args.interactive)
+                    # 安装后重新查找最佳匹配版本
+                    best = nmgr._find_best_match(requested) if isinstance(nmgr, NvmManager) else None
+                    use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
+                    plan = nmgr.switch_plan(use_ver)
+                    _emit_ipc(plan)
+                    ctx.log.success(f"Node.js: {node_resolved.raw_version} → {use_ver}")
+                activated_something = True
+            else:
+                ctx.log.warn(f"Node 管理器不可用: {ctx.cfg.node_manager}")
+
+        if not activated_something:
+            ctx.log.debug("当前目录无 Python/Node 项目标识，跳过。")
+
+        if getattr(args, "clean_cache", False):
+            clean_pycache(str(ctx.cwd))
+
+        return 0
+
+
+# ─── status ───────────────────────────────────────────────────────────────────
+
+class StatusCommand(Command):
+    name = "status"
+    help = "显示当前目录的环境状态。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        spec = detect_project(ctx.cwd)
+        table = Table(title=f"switch-env status — {ctx.cwd}")
+        table.add_column("运行时")
+        table.add_column("管理器")
+        table.add_column("请求版本")
+        table.add_column("当前版本")
+        table.add_column("状态")
+
+        # Python
+        py = ctx.resolver.resolve_python(spec)
+        if py:
+            cur_py = ctx.shell.run("python3 --version", check=False, quiet=True).stdout.strip()
+            table.add_row("Python", py.manager, py.env_ref, cur_py, "[green]已配置[/green]")
+        else:
+            table.add_row("Python", "—", "—", "—", "[dim]无标识[/dim]")
+
+        # Node
+        node = ctx.resolver.resolve_node(spec)
+        nmgr = ctx.node_managers.get(ctx.cfg.node_manager)
+        cur_node = nmgr.current_version() if nmgr and nmgr.is_available() else None
+        if node:
+            match_str = "[green]匹配[/green]" if (cur_node and node.parsed.matches(cur_node)) else "[yellow]不匹配[/yellow]"
+            table.add_row("Node.js", ctx.cfg.node_manager, node.raw_version, f"v{cur_node}" if cur_node else "—", match_str)
+        else:
+            table.add_row("Node.js", "—", "—", f"v{cur_node}" if cur_node else "—", "[dim]无标识[/dim]")
+
+        console.print(table)
+        return 0
+
+
+# ─── doctor ───────────────────────────────────────────────────────────────────
+
+class DoctorCommand(Command):
+    name = "doctor"
+    help = "诊断所有运行时管理器的可用性。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        table = Table(title="switch-env doctor")
+        table.add_column("检查项")
+        table.add_column("结果")
+        table.add_column("细节")
+
+        def ok(n: str, d: str = "") -> None:
+            table.add_row(n, "[bold green]OK[/bold green]", d)
+
+        def bad(n: str, d: str = "") -> None:
+            table.add_row(n, "[bold red]FAIL[/bold red]", d)
+
+        # pyenv
+        if ctx.shell.which(PYENV_CMD):
+            r = ctx.shell.run(f"{PYENV_CMD} --version", check=False, quiet=True)
+            ok("pyenv", r.stdout.strip())
+        else:
+            bad("pyenv", "未在 PATH 中")
+
+        # conda
+        if ctx.shell.which(CONDA_CMD):
+            r = ctx.shell.run(f"{CONDA_CMD} --version", check=False, quiet=True)
+            ok("conda", (r.stdout.strip() or r.stderr.strip()))
+        else:
+            bad("conda", "未在 PATH 中")
+
+        # nvm
+        nvm_mgr = ctx.node_managers.get("nvm")
+        if nvm_mgr and nvm_mgr.is_available():
+            ok("nvm", f"NVM_DIR={os.environ.get('NVM_DIR', '')}")
+        else:
+            bad("nvm", "NVM_DIR 未设置或 nvm.sh 不存在")
+
+        # node
+        node_path = ctx.shell.which("node")
+        if node_path:
+            r = ctx.shell.run("node --version", check=False, quiet=True)
+            ok("node", f"{r.stdout.strip()} ({node_path})")
+        else:
+            bad("node", "未在 PATH 中")
+
+        # switch-env
+        se = ctx.shell.which("switch-env")
+        if se:
+            ok("switch-env", se)
+        else:
+            bad("switch-env", "未在 PATH 中")
+
+        # shell
+        shell_name = os.environ.get("SHELL", "unknown")
+        table.add_row("shell", "[green]INFO[/green]", shell_name)
+
+        # PATH 污染检查
+        path_items = os.environ.get("PATH", "").split(":")
+        conda_idx = next((i for i, p in enumerate(path_items) if "conda" in p and "condabin" not in p), None)
+        pyenv_idx = next((i for i, p in enumerate(path_items) if "pyenv/shims" in p), None)
+        if conda_idx is not None and pyenv_idx is not None and conda_idx < pyenv_idx:
+            table.add_row("PATH 优先级", "[bold yellow]WARN[/bold yellow]",
+                          f"conda/bin (#{conda_idx+1}) 遮蔽 pyenv/shims (#{pyenv_idx+1})")
+        else:
+            ok("PATH 优先级", "pyenv/shims 优先于 conda (或无冲突)")
+
+        console.print(table)
+        return 0
+
+
+# ─── list ─────────────────────────────────────────────────────────────────────
+
+class ListCommand(Command):
+    name = "list"
+    help = "列出所有可用的 Python 版本、Conda 环境和 Node.js 版本。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        show_py = not args.node_only
+        show_node = not args.python_only
+
+        if show_py:
+            if not args.conda_only:
+                pyenv_vers = list_pyenv_versions(ctx.shell)
+                if pyenv_vers:
+                    t = Table(title="Pyenv 版本")
+                    t.add_column("版本")
+                    for v in pyenv_vers:
+                        t.add_row(v)
+                    console.print(t)
+
+            if not args.pyenv_only:
+                conda_envs = list_conda_envs(ctx.shell)
+                if conda_envs:
+                    t = Table(title="Conda 环境")
+                    t.add_column("环境名")
+                    for e in conda_envs:
+                        t.add_row(e)
+                    console.print(t)
+
+        if show_node:
+            nmgr = ctx.node_managers.get("nvm")
+            if isinstance(nmgr, NvmManager):
+                installed = nmgr._list_installed()
+                if installed:
+                    installed.sort(key=lambda v: (v.major, v.minor or 0, v.patch or 0), reverse=True)
+                    t = Table(title="Node.js 版本 (nvm)")
+                    t.add_column("版本")
+                    cur = nmgr.current_version()
+                    for v in installed:
+                        mark = " ← current" if cur and v.major == cur.major and v.minor == cur.minor and v.patch == cur.patch else ""
+                        t.add_row(f"v{v}{mark}")
+                    console.print(t)
+
+        return 0
+
+
+# ─── deactivate ───────────────────────────────────────────────────────────────
+
+class DeactivateCommand(Command):
+    name = "deactivate"
+    help = "去激活当前 Python venv/conda 环境并恢复 Node 默认版本。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        runtime = getattr(args, "runtime", "all")
+
+        if runtime in ("all", "python"):
+            for mgr in ctx.py_managers.values():
+                plan = mgr.deactivation_plan()
+                _emit_ipc(plan)
+            ctx.log.success("Python 环境已去激活。")
+
+        if runtime in ("all", "node"):
+            for mgr in ctx.node_managers.values():
+                if mgr.is_available():
+                    plan = mgr.deactivation_plan()
+                    _emit_ipc(plan)
+            ctx.log.success("Node.js 已恢复默认版本。")
+
+        return 0
+
+
+# ─── bootstrap ────────────────────────────────────────────────────────────────
+
+class BootstrapCommand(Command):
+    name = "bootstrap"
+    help = "一键初始化当前项目的全部运行时环境。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        spec = detect_project(ctx.cwd)
+
+        with progress_scope("bootstrap", ctx.log) as p:
+            t_detect = p.add_task("检测项目类型", total=1)
+            py_resolved = ctx.resolver.resolve_python(spec)
+            node_resolved = ctx.resolver.resolve_node(spec)
+            p.update(t_detect, advance=1)
+
+            # ── Python ──
+            if py_resolved:
+                mgr_name = args.py_manager or py_resolved.manager
+                mgr = ctx.py_managers.get(mgr_name)
+                if mgr and mgr.is_available():
+                    pyver = py_resolved.python_version or FALLBACK_PYTHON
+                    env_ref = py_resolved.env_ref
+
+                    t_py = p.add_task(f"确保 Python {pyver}", total=1)
+                    mgr.ensure_python(pyver, args.interactive)
+                    if mgr_name == "pyenv":
+                        mgr.set_project_python(ctx.cwd, pyver, "local")
+                    p.update(t_py, advance=1)
+
+                    venv_path = None
+                    if mgr_name == "pyenv" and ctx.cfg.prefer == "venv":
+                        t_venv = p.add_task("创建/复用 .venv", total=1)
+                        venv_path = mgr.create_or_get_venv(ctx.cwd, DEFAULT_VENV_NAME)
+                        p.update(t_venv, advance=1)
+
+                    if ctx.cfg.auto_install and not args.no_install:
+                        t_deps = p.add_task("安装 Python 依赖", total=1)
+                        cache = CacheStore(ctx.cwd, ctx.log)
+                        mgr.install_deps(spec, venv_path, cache, args.interactive)
+                        p.update(t_deps, advance=1)
+
+                    _write_project_env_file(ctx.cwd, mgr_name, env_ref, ctx.shell.dry_run)
+
+                    plan = mgr.activation_plan(ctx.cwd, venv_path, env_ref)
+                    _emit_ipc(plan)
+                    _emit_legacy_ipc(plan)
+
+            # ── Node.js ──
+            if node_resolved:
+                nmgr = ctx.node_managers.get(ctx.cfg.node_manager)
+                if nmgr and nmgr.is_available():
+                    t_node = p.add_task(f"确保 Node.js {node_resolved.raw_version}", total=1)
+                    nmgr.ensure_node(node_resolved.raw_version, args.interactive)
+                    p.update(t_node, advance=1)
+
+                    best = nmgr._find_best_match(node_resolved.parsed) if isinstance(nmgr, NvmManager) else None
+                    use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
+                    plan = nmgr.switch_plan(use_ver)
+                    _emit_ipc(plan)
+
+        ctx.log.success("bootstrap 完成。")
+        return 0
+
+
+# ─── init ─────────────────────────────────────────────────────────────────────
+
+class InitCommand(Command):
+    name = "init"
+    help = "仅创建 .venv（不做智能推断）。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        mgr = ctx.py_managers.get("pyenv")
+        if not mgr:
+            raise SwitchEnvError("pyenv 管理器不可用。")
+        venv_path = mgr.create_or_get_venv(ctx.cwd, args.name)
+        if args.install:
+            spec = detect_project(ctx.cwd)
+            cache = CacheStore(ctx.cwd, ctx.log)
+            mgr.install_deps(spec, venv_path, cache, args.interactive)
+        ctx.log.success(f"虚拟环境已就绪: {venv_path}")
+        return 0
+
+
+# ─── clean ────────────────────────────────────────────────────────────────────
+
+class CleanCommand(Command):
+    name = "clean"
+    help = "清理 __pycache__ 或删除虚拟环境。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        if args.cache_only:
+            clean_pycache(str(ctx.cwd))
+            return 0
+        venv = ctx.cwd / args.name
+        if not venv.exists():
+            ctx.log.warn(f"虚拟环境不存在: {venv}")
+            return 0
+        if args.interactive and not Confirm.ask(f"删除 {args.name}？"):
+            ctx.log.info("已取消。")
+            return 0
+        if ctx.shell.dry_run:
+            ctx.log.info(f"[dry-run] 删除 {venv}")
+            return 0
+        shutil.rmtree(venv, ignore_errors=True)
+        ctx.log.success(f"已删除: {venv}")
+        return 0
+
+
+# ─── __hook (internal, for zsh plugin) ────────────────────────────────────────
+
+class HookCommand(Command):
+    name = "__hook"
+    help = argparse.SUPPRESS
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        spec = detect_project(ctx.cwd)
+
+        # Python
+        py_resolved = ctx.resolver.resolve_python(spec)
+        if py_resolved:
+            mgr_name = py_resolved.manager
+            mgr = ctx.py_managers.get(mgr_name)
+            if mgr and mgr.is_available():
+                pyver = py_resolved.python_version
+                venv_path: Optional[Path] = None
+                if mgr_name == "pyenv":
+                    if not pyver:
+                        pyver = FALLBACK_PYTHON
+                    if args.ensure:
+                        mgr.ensure_python(pyver, interactive=False)
+                        mgr.set_project_python(ctx.cwd, pyver, "local")
+                    venv_path = mgr.create_or_get_venv(ctx.cwd, DEFAULT_VENV_NAME) if args.ensure_venv else None
+                plan = mgr.activation_plan(ctx.cwd, venv_path, py_resolved.env_ref)
+                _emit_ipc(plan)
+                _emit_legacy_ipc(plan)
+
+        # Node
+        node_resolved = ctx.resolver.resolve_node(spec)
+        if node_resolved:
+            nmgr = ctx.node_managers.get(ctx.cfg.node_manager)
+            if nmgr and nmgr.is_available():
+                current = nmgr.current_version()
+                if not current or not node_resolved.parsed.matches(current):
+                    if args.ensure:
+                        nmgr.ensure_node(node_resolved.raw_version, interactive=False)
+                    best = nmgr._find_best_match(node_resolved.parsed) if isinstance(nmgr, NvmManager) else None
+                    use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
+                    plan = nmgr.switch_plan(use_ver)
+                    _emit_ipc(plan)
+
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CLI assembly
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_context(args: argparse.Namespace) -> AppContext:
+    home = Path.home()
+    cwd = Path.cwd()
+    cfg = AppConfig.load(home)
+    log = Logger(console, verbose=bool(getattr(args, "verbose", False)))
+    shell = ShellRunner(log, dry_run=bool(getattr(args, "dry_run", False)))
+
+    py_managers: Dict[str, PythonManager] = {
+        "pyenv": PyenvManager(shell, log),
+        "conda": CondaManager(shell, log),
+    }
+    node_managers: Dict[str, NodeManager] = {
+        "nvm": NvmManager(shell, log),
+    }
+    resolver = EnvResolver(shell, cfg, log)
+    return AppContext(
+        home=home, cwd=cwd, cfg=cfg, log=log, shell=shell,
+        py_managers=py_managers, node_managers=node_managers, resolver=resolver,
+    )
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="switch-env：统一的多运行时环境自动化引擎",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("--dry-run", action="store_true", help="只打印将执行的动作。")
+    parser.add_argument("--interactive", action="store_true", help="允许交互。")
+    parser.add_argument("--verbose", action="store_true", help="调试信息。")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # use
+    p_use = sub.add_parser("use", help=UseCommand.help)
+    p_use.add_argument("--py-manager", choices=["pyenv", "conda"], help="强制 Python 管理器。")
+    p_use.add_argument("-v", "--version", dest="py_version", help="强制 Python 版本。")
+    p_use.add_argument("-e", "--env", dest="conda_env", help="强制 Conda 环境名。")
+    p_use.add_argument("--scope", choices=["local", "global"], default="local")
+    p_use.add_argument("--no-install", action="store_true", help="不自动安装。")
+    p_use.add_argument("--clean-cache", action="store_true")
+
+    # status
+    sub.add_parser("status", help=StatusCommand.help)
+
+    # doctor
+    sub.add_parser("doctor", help=DoctorCommand.help)
+
+    # list
+    p_list = sub.add_parser("list", help=ListCommand.help)
+    p_list.add_argument("--pyenv-only", action="store_true")
+    p_list.add_argument("--conda-only", action="store_true")
+    p_list.add_argument("--python-only", action="store_true")
+    p_list.add_argument("--node-only", action="store_true")
+
+    # bootstrap
+    p_boot = sub.add_parser("bootstrap", help=BootstrapCommand.help)
+    p_boot.add_argument("--py-manager", choices=["pyenv", "conda"])
+    p_boot.add_argument("--no-install", action="store_true")
+
+    # deactivate
+    p_deact = sub.add_parser("deactivate", help=DeactivateCommand.help)
+    p_deact.add_argument("--runtime", choices=["all", "python", "node"], default="all")
+
+    # init
+    p_init = sub.add_parser("init", help=InitCommand.help)
+    p_init.add_argument("-n", "--name", default=DEFAULT_VENV_NAME)
+    p_init.add_argument("-i", "--install", action="store_true")
+
+    # clean
+    p_clean = sub.add_parser("clean", help=CleanCommand.help)
+    p_clean.add_argument("-n", "--name", default=DEFAULT_VENV_NAME)
+    p_clean.add_argument("-c", "--cache-only", action="store_true")
+
+    # __hook (internal)
+    p_hook = sub.add_parser("__hook", help=argparse.SUPPRESS)
+    p_hook.add_argument("--ensure", action="store_true")
+    p_hook.add_argument("--ensure-venv", action="store_true")
+
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    ctx = build_context(args)
+
+    commands: Dict[str, Command] = {
+        c.name: c for c in [
+            UseCommand(), StatusCommand(), DoctorCommand(), ListCommand(),
+            BootstrapCommand(), DeactivateCommand(), InitCommand(), CleanCommand(),
+            HookCommand(),
+        ]
+    }
+
+    cmd = commands.get(args.command)
+    if not cmd:
+        raise SwitchEnvError(f"未知命令: {args.command}")
+    return cmd.run(ctx, args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ShellError as e:
+        console.print(f"[bold red]ERROR[/bold red] {e}")
+        if e.stderr.strip():
+            console.print(f"[red]{e.stderr.strip()}[/red]")
+        raise SystemExit(e.returncode)
+    except SwitchEnvError as e:
+        console.print(f"[bold red]ERROR[/bold red] {e}")
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        console.print("\n[bold red]中断[/bold red]")
+        raise SystemExit(130)

@@ -1,0 +1,22 @@
+# Development Workflow Rule
+
+## Daily SOP (Scheme A)
+1. Edit only repository files.
+2. Validate locally by running installer to update `~/bin`.
+3. Run verification commands.
+4. Commit repository changes.
+
+## Verification commands
+- `command -v switch-env`
+- `switch-env doctor`
+- `switch-env status`
+
+## Packaging command
+- `AUTO_YES=1 ./install-switch-env.sh --build switch-env-installer.sh`
+
+## Installation simulation
+- `AUTO_YES=1 bash ./install-switch-env.sh`
+
+## Consistency rule
+- Never manually keep repository and `~/bin` in sync by copy/overwrite.
+- Repository changes must flow into `~/bin` through installer behavior.

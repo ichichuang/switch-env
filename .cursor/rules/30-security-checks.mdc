@@ -1,0 +1,22 @@
+# Security Checks Rule
+
+## Pre-publish checks
+- Scan repository for token/key leakage patterns before commit/push.
+- Scan for machine-specific absolute paths.
+- Confirm source shebang portability.
+
+## Sensitive patterns (minimum)
+- `ghp_`
+- `API_KEY`
+- `TOKEN`
+- `secret`
+- `password`
+
+## Path leakage patterns (minimum)
+- `/Users/`
+- `/opt/homebrew/Caskroom/`
+- local private directories not required by product behavior
+
+## Required outcome
+- No credentials in tracked files.
+- No accidental local-only paths in docs or source unless intentional and documented.

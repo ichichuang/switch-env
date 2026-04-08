@@ -1,0 +1,40 @@
+name: Release Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build installer shell package
+        run: |
+          chmod +x ./install-switch-env.sh
+          AUTO_YES=1 ./install-switch-env.sh --build switch-env-installer.sh
+          chmod +x ./switch-env-installer.sh
+
+      - name: Ensure command launcher executable
+        run: |
+          chmod +x ./switch-env-installer.command
+
+      - name: Generate checksums
+        run: |
+          sha256sum switch-env-installer.sh switch-env-installer.command > sha256.txt
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            switch-env-installer.sh
+            switch-env-installer.command
+            sha256.txt
+          generate_release_notes: true

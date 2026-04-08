@@ -1,0 +1,20 @@
+# Commit Scope Rule
+
+## Scope boundary
+- Commit only files inside this repository.
+- Do not stage unrelated directories or global dotfiles.
+
+## Must include for feature/release work
+- Relevant source updates
+- README updates when command/flow changes
+- Rule updates when workflow policy changes
+
+## Must exclude
+- `~/.zshrc`
+- unrelated `~/bin` files
+- local caches, temporary artifacts, and secret files
+
+## Pre-commit checklist
+- `git status` shows only expected project files
+- no secrets/path leaks detected
+- verification commands executed for behavior-changing updates

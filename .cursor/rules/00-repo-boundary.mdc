@@ -1,0 +1,20 @@
+# Repo Boundary Rule
+
+## Core principle
+- This repository is the single source of truth for `switch-env`.
+- `~/bin` is runtime output only. Do not treat `~/bin` files as source files.
+
+## Required behavior
+- Only edit source in this repository directory.
+- Use installer flow to publish runtime files into `~/bin`.
+- Keep `.zshrc` out of repository scope.
+
+## Forbidden behavior
+- Do not copy random files from `~/bin` into this repository.
+- Do not commit machine-local cache/state files.
+- Do not commit secrets, tokens, or credentials.
+
+## Excluded from repository
+- `~/.zshrc`
+- `.venv`, `.switch-py-cache`, local runtime caches
+- Any API tokens or private keys

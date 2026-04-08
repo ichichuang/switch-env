@@ -1,0 +1,21 @@
+# Release Packaging Rule
+
+## Release artifacts
+- Source files in repository:
+  - `install-switch-env.sh`
+  - `switch-env`
+  - `switch-env.plugin.zsh`
+- Built installer:
+  - `switch-env-installer.sh`
+
+## Build policy
+- Build installer from repository root only.
+- Keep README install instructions aligned with actual build/install commands.
+
+## Distribution policy
+- Prefer `raw.githubusercontent.com` installer URL after push.
+- Support local installer execution for offline distribution.
+
+## Shebang policy
+- Source file `switch-env` should keep portable shebang (`/usr/bin/env python3`).
+- Installer can rewrite runtime shebang for installed target in `~/bin`.

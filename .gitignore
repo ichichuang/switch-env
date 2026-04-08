@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual envs
+.venv/
+.venv-tools/
+.python-version
+
+# Runtime/local state (do not version)
+.switch-py-cache/
+.switch-py-env
+.switch-env
+.mypy_cache/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Build/output artifacts
+switch-env-installer.sh
+*.log
+
+# Editor/IDE
+.idea/
+.vscode/
+
+# Cursor local state (keep rules, ignore generated plan artifacts)
+.cursor/plans/
+
+# Temporary files
+*.tmp
+*.swp
