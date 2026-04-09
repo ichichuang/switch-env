@@ -243,6 +243,35 @@ switch-env use --py-manager pyenv -v 3.12 --scope local
 switch-env use --py-manager conda -e myenv --no-install
 ```
 
+立即生效（强烈推荐）：
+
+```bash
+eval "$(switch-env use --shell)"
+node -v
+which node
+```
+
+常见现象与排障（Node 版本未切换）：
+
+- 现象：`switch-env use` 显示目标是 `v22`，但 `node -v` 仍是旧版本（如 `v16`）。
+- 原因：CLI 运行在子进程，不能直接改父 shell；必须由当前 shell `eval` 输出片段。
+- 处理：
+
+```bash
+eval "$(switch-env use --shell)"
+node -v
+which node
+type nvm
+```
+
+若 `type nvm` 显示不可用，再手动加载一次后重试：
+
+```bash
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+eval "$(switch-env use --shell)"
+```
+
 ### 2) `status`：查看当前目录环境状态
 
 作用：输出 Python / Node 请求版本、当前版本与匹配状态。
@@ -587,6 +616,43 @@ git push origin v1.0.0
   source ~/.zshrc
   ```
 - 或重开终端
+
+### Q4: `switch-env use` 显示要切到新版本，但 `node -v` 还是旧版本
+- 先用“执行层”方式（推荐）：
+  ```bash
+  eval "$(switch-env use --shell)"
+  node -v
+  which node
+  ```
+- 若仍异常，检查 nvm 是否可用：
+  ```bash
+  type nvm
+  ```
+- 如未加载，手动加载后再执行：
+  ```bash
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+  eval "$(switch-env use --shell)"
+  ```
+
+### Q5: 新终端里没有看到“切换提示”，但版本已经正确
+- 这通常是“当前版本已匹配”的正常情况：`switch-env` 判定无需切换就不会重复输出动作提示。
+- 可用以下命令确认真实状态：
+  ```bash
+  switch-env status
+  node -v
+  which node
+  ```
+
+### 1 分钟故障定位表（可直接复制排查）
+
+| 症状 | 快速命令 | 结论 | 处理 |
+|------|----------|------|------|
+| `se use` 提示 v22，但 `node -v` 仍是 v16 | `eval "$(se use --shell)"; node -v; which node` | 子进程输出未在当前 shell 执行 | 固定使用 `eval "$(se use --shell)"` |
+| `eval "$(se use --shell)"` 后仍未切换 | `type nvm` | 当前 shell 未加载 nvm 函数 | `export NVM_DIR=...; source nvm.sh` 后重试 |
+| 进入目录无切换感知 | `switch-env auto --shell` | 插件未接管或契约未触发 | 确认 `.zshrc` 已加载 plugin，重新 `source ~/.zshrc` |
+| `auto --shell` 无输出 | `switch-env resolve` | 未找到 `.switch-env` 或无可切换项 | 补齐契约文件，或检查目录层级 |
+| `auto --shell` 只告警不执行 | `switch-env trust && switch-env auto --shell` | 契约未信任或内容已变更失信 | 重新 `trust` 当前契约 |
 
 ---
 
