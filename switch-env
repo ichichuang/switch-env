@@ -1873,9 +1873,8 @@ class AutoCommand(Command):
                         parts.append(f"Node={contract.values.get('node')}")
                     if "env_file" in contract.values:
                         parts.append(f"env={contract.values.get('env_file')}")
-                    proj = contract.project_root.name
                     msg = " ".join(parts) if parts else "activated"
-                    err_console.print(f"[green]✓[/green] switch-env: {msg} (from .switch-env, project={proj})")
+                    err_console.print(f"[bold green]✓ switch-env:[/bold green] {msg}")
                 return 0
 
             ctx.log.success(f"已解析契约: {contract.file_path}")
@@ -1945,9 +1944,8 @@ class AutoCommand(Command):
             if out.strip():
                 print(out)
             if want_notify and notify_msgs:
-                unique_sources = ", ".join(sorted(set(source_markers))) if source_markers else "project markers"
                 msg = " ".join(notify_msgs)
-                err_console.print(f"[green]✓[/green] switch-env: {msg} (from {unique_sources})")
+                err_console.print(f"[bold green]✓ switch-env:[/bold green] {msg}")
             return 0
 
         # 非 shell 模式：人类可读（尽量简洁）
