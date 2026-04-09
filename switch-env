@@ -45,6 +45,7 @@ INSTALL_META_FILENAME = "meta"
 INSTALL_PLUGIN_NAME = "switch-env.plugin.zsh"
 INSTALL_BIN_NAME = "switch-env"
 INSTALLER_LATEST_URL = "https://github.com/ichichuang/switch-env/releases/latest/download/switch-env-installer.sh"
+BOOTSTRAP_LATEST_URL = "https://github.com/ichichuang/switch-env/releases/latest/download/install.sh"
 
 PYENV_CMD = "pyenv"
 CONDA_CMD = "conda"
@@ -1447,7 +1448,7 @@ class RepairCommand(Command):
         if not target_plugin.exists() or not st.has_plugin_fingerprint:
             ctx.log.warn("plugin 缺失或异常。")
             ctx.log.info("建议重新运行官方安装器以恢复 plugin：")
-            ctx.log.info(f"curl -fsSL {INSTALLER_LATEST_URL} | AUTO_YES=1 bash")
+            ctx.log.info(f"curl -fsSL {BOOTSTRAP_LATEST_URL} | AUTO_YES=1 bash")
 
         post = detect_install_state(ctx.home, ctx.log, debug=bool(getattr(args, "verbose", False)))
         if post.mode == "update":
@@ -1467,7 +1468,7 @@ class UpgradeCommand(Command):
             ctx.log.error("检测到冲突状态，升级已中止。请先执行 `switch-env repair`。")
             return 1
 
-        cmd = f"curl -fsSL {INSTALLER_LATEST_URL} | AUTO_YES=1 bash"
+        cmd = f"curl -fsSL {BOOTSTRAP_LATEST_URL} | AUTO_YES=1 bash"
         ctx.log.info(f"执行升级: {cmd}")
         res = ctx.shell.run(cmd, check=False)
         if res.returncode != 0:
