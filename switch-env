@@ -31,7 +31,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 console = Console()
-console_err = Console(stderr=True)
+err_console = Console(stderr=True)
 
 # ─── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -1873,7 +1873,7 @@ class AutoCommand(Command):
                         parts.append(f"env={contract.values.get('env_file')}")
                     proj = contract.project_root.name
                     msg = " ".join(parts) if parts else "activated"
-                    console_err.print(f"[green]✓[/green] switch-env: {msg} (from .switch-env, project={proj})")
+                    err_console.print(f"[green]✓[/green] switch-env: {msg} (from .switch-env, project={proj})")
                 return 0
 
             ctx.log.success(f"已解析契约: {contract.file_path}")
@@ -1945,7 +1945,7 @@ class AutoCommand(Command):
             if want_notify and notify_msgs:
                 unique_sources = ", ".join(sorted(set(source_markers))) if source_markers else "project markers"
                 msg = " ".join(notify_msgs)
-                console_err.print(f"[green]✓[/green] switch-env: {msg} (from {unique_sources})")
+                err_console.print(f"[green]✓[/green] switch-env: {msg} (from {unique_sources})")
             return 0
 
         # 非 shell 模式：人类可读（尽量简洁）
@@ -2110,7 +2110,7 @@ def build_context(args: argparse.Namespace) -> AppContext:
     cwd = Path.cwd()
     cfg = AppConfig.load(home)
     silent = bool(getattr(args, "shell", False))
-    log = SilentLogger() if silent else Logger(console, verbose=bool(getattr(args, "verbose", False)))
+    log = SilentLogger() if silent else Logger(err_console, verbose=bool(getattr(args, "verbose", False)))
     shell = ShellRunner(log, dry_run=bool(getattr(args, "dry_run", False)))
 
     py_managers: Dict[str, PythonManager] = {
@@ -2235,13 +2235,13 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except ShellError as e:
-        console.print(f"[bold red]ERROR[/bold red] {e}")
+        err_console.print(f"[bold red]ERROR[/bold red] {e}")
         if e.stderr.strip():
-            console.print(f"[red]{e.stderr.strip()}[/red]")
+            err_console.print(f"[red]{e.stderr.strip()}[/red]")
         raise SystemExit(e.returncode)
     except SwitchEnvError as e:
-        console.print(f"[bold red]ERROR[/bold red] {e}")
+        err_console.print(f"[bold red]ERROR[/bold red] {e}")
         raise SystemExit(1)
     except KeyboardInterrupt:
-        console.print("\n[bold red]中断[/bold red]")
+        err_console.print("\n[bold red]中断[/bold red]")
         raise SystemExit(130)
