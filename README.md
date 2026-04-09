@@ -223,6 +223,18 @@ eval "$(switch-env deactivate --shell)"
 - 若未加载 zsh 插件，直接执行 `switch-env use` 不会修改父 shell 环境；请改用 `eval "$(switch-env use --shell)"`。
 - 旧版 IPC 前缀 `__SWITCH_ENV_CMD__:` 仅用于历史兼容，不建议在新脚本中继续依赖。
 
+### 输出通道约定（stdout / stderr）
+
+为兼顾“可读反馈”和“可管道数据”，`switch-env` 采用双通道约定：
+
+- `stdout`：数据型输出（如 `doctor/status/list` 表格、`resolve` 路径、`--shell` 机器命令片段）
+- `stderr`：日志与提示（`INFO/WARN/OK/ERROR`）以及异常信息
+
+这意味着：
+
+- `switch-env doctor > doctor.out 2> doctor.err` 时，表格在 `doctor.out`，提示在 `doctor.err`。
+- `switch-env use --shell` / `switch-env auto --shell` 的 `stdout` 保持可 `eval` 的纯 shell 内容，不混入日志文本。
+
 ### 1) `use`：智能切换/激活当前目录环境
 
 作用：根据项目标识自动切 Python / Node，并按需安装依赖。
