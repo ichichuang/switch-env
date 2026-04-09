@@ -561,8 +561,7 @@ class NvmManager(NodeManager):
         return "nvm"
 
     def is_available(self) -> bool:
-        nvm_dir = os.environ.get("NVM_DIR", "")
-        return bool(nvm_dir) and Path(nvm_dir, "nvm.sh").exists()
+        return Path(self._nvm_dir(), "nvm.sh").exists()
 
     def _nvm_dir(self) -> str:
         return os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
@@ -631,11 +630,25 @@ class NvmManager(NodeManager):
 
     def switch_plan(self, requested: str) -> ActivatePlan:
         """生成切换到指定 node 版本的 shell 命令。"""
-        nvm_sh = shlex_quote(self._nvm_dir() + "/nvm.sh")
-        return ActivatePlan(kind="shell_cmd", shell_cmds=[f"nvm use {shlex_quote(requested)}"])
+        # 关键：确保 nvm.sh 已被 source，否则 `nvm use` 可能无法正确刷新当前 shell 的 PATH/node 指向
+        return ActivatePlan(
+            kind="shell_cmd",
+            shell_cmds=[
+                'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
+                '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
+                f'if command -v nvm >/dev/null 2>&1; then nvm use {shlex_quote(requested)} >/dev/null; fi',
+            ],
+        )
 
     def deactivation_plan(self) -> ActivatePlan:
-        return ActivatePlan(kind="shell_cmd", shell_cmds=["nvm use default 2>/dev/null"])
+        return ActivatePlan(
+            kind="shell_cmd",
+            shell_cmds=[
+                'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
+                '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
+                'if command -v nvm >/dev/null 2>&1; then nvm use default 2>/dev/null; fi',
+            ],
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1287,16 +1300,19 @@ class UseCommand(Command):
             if nmgr and nmgr.is_available():
                 current = nmgr.current_version()
                 requested = node_resolved.parsed
+                expected_after: Optional[SemVer] = None
 
                 if current and requested.matches(current):
                     if not want_shell:
                         node_summary = f"[green]✓[/green] Node v{current} (nvm)"
+                        expected_after = current
                 else:
                     if not args.no_install:
                         nmgr.ensure_node(node_resolved.raw_version, args.interactive)
                     # 安装后重新查找最佳匹配版本
                     best = nmgr._find_best_match(requested) if isinstance(nmgr, NvmManager) else None
                     use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
+                    expected_after = SemVer.parse(use_ver)
                     plan = nmgr.switch_plan(use_ver)
                     if want_shell:
                         shell_cmds.extend(plan.shell_cmds)
@@ -1329,6 +1345,16 @@ class UseCommand(Command):
             console.print(py_summary)
         if node_summary:
             console.print(node_summary)
+            # 轻量校验：避免“显示已切换但实际 node 仍指向其它来源”的误导
+            if not want_verbose:
+                r = ctx.shell.run("node --version", check=False, quiet=True)
+                real = SemVer.parse(r.stdout.strip()) if r.returncode == 0 else None
+                # 若解析不到或不匹配，提示当前 node 来源
+                if real and expected_after and not expected_after.matches(real):
+                    node_path = ctx.shell.which("node") or "unknown"
+                    console.print(
+                        f"[yellow]⚠[/yellow] Node 未完全生效：当前 node={r.stdout.strip() or 'unknown'} 来自 {node_path}"
+                    )
         if not activated_something:
             console.print("[dim]•[/dim] 未检测到可切换的 Python/Node 标识")
 
