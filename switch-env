@@ -92,6 +92,26 @@ class Logger:
             self._c.print(f"[dim]DEBUG[/dim] {msg}")
 
 
+class SilentLogger(Logger):
+    def __init__(self) -> None:
+        super().__init__(console, verbose=False)
+
+    def info(self, msg: str) -> None:
+        return
+
+    def warn(self, msg: str) -> None:
+        return
+
+    def error(self, msg: str) -> None:
+        return
+
+    def success(self, msg: str) -> None:
+        return
+
+    def debug(self, msg: str) -> None:
+        return
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  core / shell runner
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -789,6 +809,10 @@ def _emit_legacy_ipc(plan: ActivatePlan) -> None:
             print(f"{LEGACY_IPC_PREFIX}:{cmd}")
 
 
+def _render_shell_cmds(cmds: List[str]) -> str:
+    return "\n".join(cmds)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  core / utility functions
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1205,6 +1229,13 @@ class UseCommand(Command):
     def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
         spec = detect_project(ctx.cwd)
         activated_something = False
+        want_shell = bool(getattr(args, "shell", False))
+        shell_cmds: List[str] = []
+        want_verbose = bool(getattr(args, "verbose", False))
+
+        py_summary: Optional[str] = None
+        node_summary: Optional[str] = None
+        warnings: List[str] = []
 
         # ── Python ──
         py_resolved = ctx.resolver.resolve_python(spec)
@@ -1212,7 +1243,7 @@ class UseCommand(Command):
             mgr_name = args.py_manager or py_resolved.manager
             mgr = ctx.py_managers.get(mgr_name)
             if not mgr or not mgr.is_available():
-                ctx.log.warn(f"Python 管理器不可用: {mgr_name}")
+                warnings.append(f"Python 管理器不可用: {mgr_name}")
             else:
                 env_ref = py_resolved.env_ref
                 pyver = py_resolved.python_version
@@ -1236,10 +1267,18 @@ class UseCommand(Command):
                     _write_project_env_file(ctx.cwd, mgr_name, env_ref, ctx.shell.dry_run)
 
                 plan = mgr.activation_plan(ctx.cwd, venv_path, env_ref)
-                _emit_ipc(plan)
-                _emit_legacy_ipc(plan)
-                ctx.log.success(f"Python: manager={mgr_name}, env={env_ref}")
+                if want_shell:
+                    shell_cmds.extend(plan.shell_cmds)
+                else:
+                    if want_verbose:
+                        _emit_ipc(plan)
+                        _emit_legacy_ipc(plan)
+                    venv_note = f" ({DEFAULT_VENV_NAME})" if (venv_path is not None) else ""
+                    py_summary = f"[green]✓[/green] Python {pyver or env_ref} ({mgr_name}{venv_note})"
                 activated_something = True
+        else:
+            if not want_shell:
+                py_summary = "[dim]•[/dim] Python (无标识)"
 
         # ── Node.js ──
         node_resolved = ctx.resolver.resolve_node(spec)
@@ -1250,7 +1289,8 @@ class UseCommand(Command):
                 requested = node_resolved.parsed
 
                 if current and requested.matches(current):
-                    ctx.log.debug(f"Node.js 已是 v{current}，匹配 {node_resolved.raw_version}，无需切换。")
+                    if not want_shell:
+                        node_summary = f"[green]✓[/green] Node v{current} (nvm)"
                 else:
                     if not args.no_install:
                         nmgr.ensure_node(node_resolved.raw_version, args.interactive)
@@ -1258,17 +1298,39 @@ class UseCommand(Command):
                     best = nmgr._find_best_match(requested) if isinstance(nmgr, NvmManager) else None
                     use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
                     plan = nmgr.switch_plan(use_ver)
-                    _emit_ipc(plan)
-                    ctx.log.success(f"Node.js: {node_resolved.raw_version} → {use_ver}")
+                    if want_shell:
+                        shell_cmds.extend(plan.shell_cmds)
+                    else:
+                        if want_verbose:
+                            _emit_ipc(plan)
+                        node_summary = f"[green]✓[/green] Node {use_ver} (nvm)"
                 activated_something = True
             else:
-                ctx.log.warn(f"Node 管理器不可用: {ctx.cfg.node_manager}")
+                warnings.append(f"Node 管理器不可用: {ctx.cfg.node_manager}")
+        else:
+            if not want_shell:
+                node_summary = "[dim]•[/dim] Node (无标识)"
 
-        if not activated_something:
-            ctx.log.debug("当前目录无 Python/Node 项目标识，跳过。")
+        if want_shell:
+            if shell_cmds:
+                print(_render_shell_cmds(shell_cmds))
+                return 0
+            return 0
+
+        if warnings and want_verbose:
+            for w in warnings:
+                ctx.log.warn(w)
 
         if getattr(args, "clean_cache", False):
             clean_pycache(str(ctx.cwd))
+
+        # 默认输出：结果卡片（简洁）
+        if py_summary:
+            console.print(py_summary)
+        if node_summary:
+            console.print(node_summary)
+        if not activated_something:
+            console.print("[dim]•[/dim] 未检测到可切换的 Python/Node 标识")
 
         return 0
 
@@ -1456,19 +1518,40 @@ class DeactivateCommand(Command):
 
     def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
         runtime = getattr(args, "runtime", "all")
+        want_shell = bool(getattr(args, "shell", False))
+        shell_cmds: List[str] = []
+        want_verbose = bool(getattr(args, "verbose", False))
 
         if runtime in ("all", "python"):
             for mgr in ctx.py_managers.values():
                 plan = mgr.deactivation_plan()
-                _emit_ipc(plan)
-            ctx.log.success("Python 环境已去激活。")
+                if want_shell:
+                    shell_cmds.extend(plan.shell_cmds)
+                else:
+                    if want_verbose:
+                        _emit_ipc(plan)
 
         if runtime in ("all", "node"):
             for mgr in ctx.node_managers.values():
                 if mgr.is_available():
                     plan = mgr.deactivation_plan()
-                    _emit_ipc(plan)
-            ctx.log.success("Node.js 已恢复默认版本。")
+                    if want_shell:
+                        shell_cmds.extend(plan.shell_cmds)
+                    else:
+                        if want_verbose:
+                            _emit_ipc(plan)
+
+        if want_shell:
+            if shell_cmds:
+                print(_render_shell_cmds(shell_cmds))
+                return 0
+            return 0
+
+        # 默认输出：简洁摘要
+        if runtime in ("all", "python"):
+            console.print("[green]✓[/green] Python 已去激活")
+        if runtime in ("all", "node"):
+            console.print("[green]✓[/green] Node 已恢复默认版本")
 
         return 0
 
@@ -1481,6 +1564,52 @@ class BootstrapCommand(Command):
 
     def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
         spec = detect_project(ctx.cwd)
+        want_shell = bool(getattr(args, "shell", False))
+        shell_cmds: List[str] = []
+        want_verbose = bool(getattr(args, "verbose", False))
+        py_summary: Optional[str] = None
+        node_summary: Optional[str] = None
+
+        if want_shell:
+            py_resolved = ctx.resolver.resolve_python(spec)
+            node_resolved = ctx.resolver.resolve_node(spec)
+
+            # ── Python ──
+            if py_resolved:
+                mgr_name = args.py_manager or py_resolved.manager
+                mgr = ctx.py_managers.get(mgr_name)
+                if mgr and mgr.is_available():
+                    pyver = py_resolved.python_version or FALLBACK_PYTHON
+                    env_ref = py_resolved.env_ref
+                    mgr.ensure_python(pyver, args.interactive)
+                    if mgr_name == "pyenv":
+                        mgr.set_project_python(ctx.cwd, pyver, "local")
+
+                    venv_path = None
+                    if mgr_name == "pyenv" and ctx.cfg.prefer == "venv":
+                        venv_path = mgr.create_or_get_venv(ctx.cwd, DEFAULT_VENV_NAME)
+
+                    if ctx.cfg.auto_install and not args.no_install:
+                        cache = CacheStore(ctx.cwd, ctx.log)
+                        mgr.install_deps(spec, venv_path, cache, args.interactive)
+
+                    _write_project_env_file(ctx.cwd, mgr_name, env_ref, ctx.shell.dry_run)
+                    plan = mgr.activation_plan(ctx.cwd, venv_path, env_ref)
+                    shell_cmds.extend(plan.shell_cmds)
+
+            # ── Node.js ──
+            if node_resolved:
+                nmgr = ctx.node_managers.get(ctx.cfg.node_manager)
+                if nmgr and nmgr.is_available():
+                    nmgr.ensure_node(node_resolved.raw_version, args.interactive)
+                    best = nmgr._find_best_match(node_resolved.parsed) if isinstance(nmgr, NvmManager) else None
+                    use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
+                    plan = nmgr.switch_plan(use_ver)
+                    shell_cmds.extend(plan.shell_cmds)
+
+            if shell_cmds:
+                print(_render_shell_cmds(shell_cmds))
+            return 0
 
         with progress_scope("bootstrap", ctx.log) as p:
             t_detect = p.add_task("检测项目类型", total=1)
@@ -1519,6 +1648,7 @@ class BootstrapCommand(Command):
                     plan = mgr.activation_plan(ctx.cwd, venv_path, env_ref)
                     _emit_ipc(plan)
                     _emit_legacy_ipc(plan)
+                    py_summary = f"[green]✓[/green] Python {pyver} ({mgr_name}{' ('+DEFAULT_VENV_NAME+')' if (venv_path is not None) else ''})"
 
             # ── Node.js ──
             if node_resolved:
@@ -1532,8 +1662,17 @@ class BootstrapCommand(Command):
                     use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
                     plan = nmgr.switch_plan(use_ver)
                     _emit_ipc(plan)
+                    node_summary = f"[green]✓[/green] Node {use_ver} (nvm)"
 
-        ctx.log.success("bootstrap 完成。")
+        if not want_verbose:
+            # progress_scope 本身会输出进度；非 verbose 下只补充最终摘要
+            if py_summary:
+                console.print(py_summary)
+            if node_summary:
+                console.print(node_summary)
+            console.print("[green]✓[/green] bootstrap 完成")
+        else:
+            ctx.log.success("bootstrap 完成。")
         return 0
 
 
@@ -1827,7 +1966,8 @@ def build_context(args: argparse.Namespace) -> AppContext:
     home = Path.home()
     cwd = Path.cwd()
     cfg = AppConfig.load(home)
-    log = Logger(console, verbose=bool(getattr(args, "verbose", False)))
+    silent = bool(getattr(args, "shell", False))
+    log = SilentLogger() if silent else Logger(console, verbose=bool(getattr(args, "verbose", False)))
     shell = ShellRunner(log, dry_run=bool(getattr(args, "dry_run", False)))
 
     py_managers: Dict[str, PythonManager] = {
@@ -1863,6 +2003,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_use.add_argument("--scope", choices=["local", "global"], default="local")
     p_use.add_argument("--no-install", action="store_true", help="不自动安装。")
     p_use.add_argument("--clean-cache", action="store_true")
+    p_use.add_argument("--shell", action="store_true", help="输出可 eval 的纯 shell 命令（stdout 仅此内容）。")
 
     # status
     sub.add_parser("status", help=StatusCommand.help)
@@ -1881,10 +2022,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_boot = sub.add_parser("bootstrap", help=BootstrapCommand.help)
     p_boot.add_argument("--py-manager", choices=["pyenv", "conda"])
     p_boot.add_argument("--no-install", action="store_true")
+    p_boot.add_argument("--shell", action="store_true", help="输出可 eval 的纯 shell 命令（stdout 仅此内容）。")
 
     # deactivate
     p_deact = sub.add_parser("deactivate", help=DeactivateCommand.help)
     p_deact.add_argument("--runtime", choices=["all", "python", "node"], default="all")
+    p_deact.add_argument("--shell", action="store_true", help="输出可 eval 的纯 shell 命令（stdout 仅此内容）。")
 
     # init
     p_init = sub.add_parser("init", help=InitCommand.help)
