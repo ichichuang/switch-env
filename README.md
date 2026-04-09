@@ -14,7 +14,7 @@
 ### 路径 A：命令行一键安装（开发者推荐）
 
 ```bash
-curl -fsSL https://github.com/ichichuang/switch-env/releases/latest/download/switch-env-installer.sh | AUTO_YES=1 bash
+curl -fsSL https://github.com/ichichuang/switch-env/releases/latest/download/install.sh | AUTO_YES=1 bash
 ```
 
 说明：
@@ -54,7 +54,7 @@ source ~/.zshrc
 冲突时如你确认覆盖，使用：
 
 ```bash
-FORCE=1 curl -fsSL https://github.com/ichichuang/switch-env/releases/latest/download/switch-env-installer.sh | AUTO_YES=1 bash
+FORCE=1 curl -fsSL https://github.com/ichichuang/switch-env/releases/latest/download/install.sh | AUTO_YES=1 bash
 ```
 
 调试安装模式评分（排障专用）：
@@ -241,6 +241,7 @@ switch-env upgrade
 
 说明：
 - 若当前安装态为 `conflict`，会先阻止升级并提示执行 `switch-env repair`
+- 升级入口与安装入口一致（统一走 `install.sh` bootstrap）
 - 升级完成后会再次检测安装态并输出结果
 
 ---
@@ -282,8 +283,8 @@ DEBUG_INSTALL_MODE=1 QUIET=0 ./install-switch-env.sh
 ## 双击安装器说明（switch-env-installer.command）
 
 行为：
-- 自动下载 latest 安装器：`switch-env-installer.sh`
-- 调用安装器执行安装
+- 自动下载 latest bootstrap：`install.sh`
+- bootstrap 再下载正式安装器 `switch-env-installer.sh` 并执行
 - 显示成功/失败状态并防止窗口闪退
 
 ---
@@ -322,6 +323,7 @@ switch-env doctor
 - 推送 tag：`v*`（例如 `v1.0.0`）
 
 发布产物：
+- `install.sh`
 - `switch-env-installer.sh`
 - `switch-env-installer.command`
 - `sha256.txt`
@@ -381,6 +383,7 @@ git push origin v1.0.0
 - `install-switch-env.sh`：安装/卸载/打包脚本
 - `switch-env`：Python CLI 主程序
 - `switch-env.plugin.zsh`：zsh 插件
+- `install.sh`：一行安装 bootstrap 入口（支持 `curl | bash`）
 - `switch-env-installer.command`：双击安装入口
 - `.github/workflows/release.yml`：tag 自动发布流程
 - `.cursor/rules`：项目规则文件
