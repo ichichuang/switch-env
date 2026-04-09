@@ -82,7 +82,7 @@ SWITCH_ENV_DEBUG=1 QUIET=0 bash ./install-switch-env.sh
 当你 `cd` 进入项目目录（或其子目录）时，zsh 插件会调用：
 
 ```bash
-switch-env auto --shell
+switch-env auto --shell --notify
 ```
 
 并将输出的 shell 命令 `eval` 到当前会话中。
@@ -93,7 +93,7 @@ switch-env auto --shell
 - `auto` 支持两层策略：优先使用 `.switch-env`（契约模式）；若不存在契约，会自动从 `.nvmrc`、`.node-version`、`.python-version`、`pyproject.toml`、`requirements.txt`、`environment.yml`、`package.json` 等传统标识文件推断并切换（无需在项目中新建文件）。
 - `switch-env auto --json`：输出结构化 JSON，便于审计与调试。
 - `switch-env auto --shell`：基于计划渲染 shell-safe 命令，供 plugin `eval` 执行。
-- `switch-env auto --notify`：仅在发生实际切换/激活时输出一行提示（走 stderr，不污染 `--shell` 的 stdout）。
+- `switch-env auto --shell --notify`：仅在发生实际切换/激活时输出一行提示（走 stderr，不污染 `--shell` 的 stdout，格式含来源 `from ...`）。
 - 未授权契约时默认安全 no-op：`--shell` 不输出命令到 stdout，仅在 stderr 提示需先 `trust`。
 
 示例：
@@ -234,7 +234,7 @@ eval "$(switch-env deactivate --shell)"
 
 - `switch-env doctor > doctor.out 2> doctor.err` 时，表格在 `doctor.out`，提示在 `doctor.err`。
 - `switch-env use --shell` / `switch-env auto --shell` 的 `stdout` 保持可 `eval` 的纯 shell 内容，不混入日志文本。
-- `switch-env auto --shell --notify` 会将“给人看的提示”输出到 `stderr`，即使外层用 `$(...)` 捕获 `stdout`，提示仍会显示在终端。
+- `switch-env use --shell --notify` 与 `switch-env auto --shell --notify` 会将“给人看的提示”输出到 `stderr`，即使外层用 `$(...)` 捕获 `stdout`，提示仍会显示在终端，且提示包含来源 `from ...`。
 
 ### 1) `use`：智能切换/激活当前目录环境
 
@@ -247,6 +247,7 @@ eval "$(switch-env deactivate --shell)"
 - `--scope {local,global}`：pyenv 写入范围（默认 `local`）
 - `--no-install`：不自动安装缺失版本或依赖
 - `--clean-cache`：切换后清理缓存
+- `--notify`：仅在发生实际切换/激活时输出一行提示（stderr，含来源 `from ...`）
 
 示例：
 
@@ -661,7 +662,7 @@ git push origin v1.0.0
 
 | 症状 | 快速命令 | 结论 | 处理 |
 |------|----------|------|------|
-| `se use` 提示 v22，但 `node -v` 仍是 v16 | `eval "$(se use --shell)"; node -v; which node` | 子进程输出未在当前 shell 执行 | 固定使用 `eval "$(se use --shell)"` |
+| `se use` 提示 v22，但 `node -v` 仍是 v16 | `eval "$(se use --shell)"; node -v; which node` | 子进程输出未在当前 shell 执行（`se use` 默认已带 `--notify`） | 固定使用 `eval "$(se use --shell)"` |
 | `eval "$(se use --shell)"` 后仍未切换 | `type nvm` | 当前 shell 未加载 nvm 函数 | `export NVM_DIR=...; source nvm.sh` 后重试 |
 | 进入目录无切换感知 | `switch-env auto --shell` | 插件未接管或契约未触发 | 确认 `.zshrc` 已加载 plugin，重新 `source ~/.zshrc` |
 | `auto --shell` 无输出 | `switch-env resolve` | 未找到 `.switch-env` 或无可切换项 | 补齐契约文件，或检查目录层级 |
