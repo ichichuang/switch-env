@@ -75,13 +75,12 @@ _switch_env_chpwd() {
     export SWITCH_ENV_PROJECT_ROOT="$new_root"
     export SWITCH_ENV_LAZY_DONE=""  # 新项目，重置懒加载
 
-    local use_out
-    use_out="$(switch-env use 2>/dev/null)"
-    _switch_env_eval_ipc "$use_out"
+    # 新架构：自动契约引擎（shell-safe 输出）
+    eval "$(switch-env auto --shell 2>/dev/null)"
 
-    # 标记已激活的运行时
-    [[ "$use_out" == *"source "* || "$use_out" == *"conda activate"* ]] && export SWITCH_ENV_PY_ACTIVE=1
-    [[ "$use_out" == *"nvm use"* ]] && export SWITCH_ENV_NODE_ACTIVE=1
+    # 标记由 auto 推断触发
+    export SWITCH_ENV_PY_ACTIVE=1
+    export SWITCH_ENV_NODE_ACTIVE=1
   fi
 }
 
@@ -100,9 +99,8 @@ _switch_env_lazy_activate() {
     export SWITCH_ENV_PROJECT_ROOT="$root"
   fi
 
-  local hook_out
-  hook_out="$(switch-env __hook --ensure --ensure-venv 2>/dev/null)"
-  _switch_env_eval_ipc "$hook_out"
+  # v1: 统一走 auto 契约入口
+  eval "$(switch-env auto --shell 2>/dev/null)"
 
   export SWITCH_ENV_LAZY_DONE=1
 }
@@ -136,7 +134,7 @@ _switch_env_completion() {
   local cur prev commands
   cur="${words[CURRENT]}"
   prev="${words[CURRENT-1]}"
-  commands="use status doctor list bootstrap deactivate init clean"
+  commands="use status doctor list bootstrap deactivate init clean resolve trust untrust auto repair upgrade"
 
   if (( CURRENT == 2 )); then
     compadd $commands
@@ -211,6 +209,16 @@ _switch_env_completion() {
     clean)
       if [[ "$cur" == -* ]]; then
         compadd "-n" "--name" "-c" "--cache-only" "--dry-run" "--interactive" "--verbose" "-h" "--help"
+      fi
+      ;;
+    auto)
+      if [[ "$cur" == -* ]]; then
+        compadd "--dry-run" "--interactive" "--verbose" "-h" "--help" "--shell" "--json"
+      fi
+      ;;
+    resolve|trust|untrust|repair|upgrade)
+      if [[ "$cur" == -* ]]; then
+        compadd "--dry-run" "--interactive" "--verbose" "-h" "--help"
       fi
       ;;
   esac
