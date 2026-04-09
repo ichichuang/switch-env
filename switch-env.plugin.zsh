@@ -13,11 +13,10 @@ _switch_env_eval_ipc() {
 }
 
 _switch_env_with_lock_capture() {
-  local cmd="$1"
   local out
   {
     export SWITCH_ENV_EXECUTING=1
-    out="$(eval "$cmd")"
+    out="$("$@")"
   } always {
     unset SWITCH_ENV_EXECUTING
   }
@@ -55,7 +54,7 @@ _switch_env_chpwd() {
 
   if [[ -n "$old_root" ]]; then
     export SWITCH_ENV_PROJECT_ROOT=""
-    _switch_env_with_lock_capture "switch-env deactivate --shell"
+    _switch_env_with_lock_capture switch-env deactivate --shell
     if [[ -n "$REPLY" ]]; then
       eval "$REPLY"
     fi
@@ -63,7 +62,7 @@ _switch_env_chpwd() {
 
   if [[ -n "$new_root" ]]; then
     export SWITCH_ENV_PROJECT_ROOT="$new_root"
-    _switch_env_with_lock_capture "switch-env auto --shell --notify"
+    _switch_env_with_lock_capture switch-env auto --shell --notify
     if [[ -n "$REPLY" ]]; then
       eval "$REPLY"
     fi
@@ -82,7 +81,7 @@ se() {
     if ! _switch_env_has_flag "--notify" "${argv[@]}"; then
       argv+=("--notify")
     fi
-    _switch_env_with_lock_capture "switch-env ${(@q)argv}"
+    _switch_env_with_lock_capture switch-env "${argv[@]}"
     if [[ -n "$REPLY" ]]; then
       eval "$REPLY"
     fi
@@ -91,7 +90,7 @@ se() {
     if ! _switch_env_has_flag "--shell" "${argv[@]}"; then
       argv+=("--shell")
     fi
-    _switch_env_with_lock_capture "switch-env ${(@q)argv}"
+    _switch_env_with_lock_capture switch-env "${argv[@]}"
     if [[ -n "$REPLY" ]]; then
       eval "$REPLY"
     fi
@@ -111,7 +110,7 @@ _switch_env_wrap_cmd() {
 
   if [[ -z "$SWITCH_ENV_LAZY_DONE" ]]; then
     export SWITCH_ENV_LAZY_DONE=1
-    _switch_env_with_lock_capture "switch-env __hook --ensure --ensure-venv"
+    _switch_env_with_lock_capture switch-env __hook --ensure --ensure-venv
     _switch_env_eval_ipc "$REPLY"
   fi
   command "$cmd" "$@"
