@@ -113,7 +113,15 @@ PAYLOAD_DIR=""
 PAYLOAD_IS_TEMP=0
 
 extract_payloads() {
-  # 尝试从自身解压内嵌载荷
+  # 优先伴随文件模式：开发态下确保安装内容与仓库源码一致
+  if [[ -f "$SCRIPT_DIR/switch-env" && -f "$SCRIPT_DIR/switch-env.plugin.zsh" ]]; then
+    PAYLOAD_DIR="$SCRIPT_DIR"
+    PAYLOAD_IS_TEMP=0
+    ok "在同目录找到伴随文件"
+    return 0
+  fi
+
+  # 其次尝试从自身解压内嵌载荷（release 单文件场景）
   if grep -q "$PAYLOAD_MARKER" "$SELF" 2>/dev/null; then
     PAYLOAD_DIR="$(mktemp -d)"
     PAYLOAD_IS_TEMP=1
@@ -147,14 +155,6 @@ extract_payloads() {
       rm -rf "$PAYLOAD_DIR"
       PAYLOAD_IS_TEMP=0
     fi
-  fi
-
-  # 伴随文件模式
-  if [[ -f "$SCRIPT_DIR/switch-env" && -f "$SCRIPT_DIR/switch-env.plugin.zsh" ]]; then
-    PAYLOAD_DIR="$SCRIPT_DIR"
-    PAYLOAD_IS_TEMP=0
-    ok "在同目录找到伴随文件"
-    return 0
   fi
 
   fatal "未找到安装所需文件。请确保 switch-env 和 switch-env.plugin.zsh 与安装脚本在同一目录，或使用 build-installer.sh 打包的单文件版本。"
