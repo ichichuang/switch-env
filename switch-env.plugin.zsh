@@ -56,13 +56,17 @@ _switch_env_chpwd() {
   if [[ -n "$old_root" ]]; then
     export SWITCH_ENV_PROJECT_ROOT=""
     _switch_env_with_lock_capture "switch-env deactivate --shell"
-    _switch_env_eval_ipc "$REPLY"
+    if [[ -n "$REPLY" ]]; then
+      eval "$REPLY"
+    fi
   fi
 
   if [[ -n "$new_root" ]]; then
     export SWITCH_ENV_PROJECT_ROOT="$new_root"
     _switch_env_with_lock_capture "switch-env auto --shell --notify"
-    _switch_env_eval_ipc "$REPLY"
+    if [[ -n "$REPLY" ]]; then
+      eval "$REPLY"
+    fi
   fi
 }
 
@@ -79,14 +83,18 @@ se() {
       argv+=("--notify")
     fi
     _switch_env_with_lock_capture "switch-env ${(@q)argv}"
-    _switch_env_eval_ipc "$REPLY"
+    if [[ -n "$REPLY" ]]; then
+      eval "$REPLY"
+    fi
   elif [[ "$1" == "deactivate" ]]; then
     local -a argv=("$@")
     if ! _switch_env_has_flag "--shell" "${argv[@]}"; then
       argv+=("--shell")
     fi
     _switch_env_with_lock_capture "switch-env ${(@q)argv}"
-    _switch_env_eval_ipc "$REPLY"
+    if [[ -n "$REPLY" ]]; then
+      eval "$REPLY"
+    fi
   else
     switch-env "$@"
   fi
