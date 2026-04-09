@@ -90,6 +90,7 @@ switch-env auto --shell
 ### 协议边界（JSON IPC + Shell 输出）
 
 - Python 决策层会先构建 `RuntimePlan`（结构化计划对象）。
+- `auto` 支持两层策略：优先使用 `.switch-env`（契约模式）；若不存在契约，会自动从 `.nvmrc`、`.node-version`、`.python-version`、`pyproject.toml`、`requirements.txt`、`environment.yml`、`package.json` 等传统标识文件推断并切换（无需在项目中新建文件）。
 - `switch-env auto --json`：输出结构化 JSON，便于审计与调试。
 - `switch-env auto --shell`：基于计划渲染 shell-safe 命令，供 plugin `eval` 执行。
 - `switch-env auto --notify`：仅在发生实际切换/激活时输出一行提示（走 stderr，不污染 `--shell` 的 stdout）。
