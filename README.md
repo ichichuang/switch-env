@@ -183,7 +183,7 @@ switch-env status
 说明：
 
 - 不带子命令时执行 `switch-env` 会打印帮助并退出（退出码 `0`）。
-- zsh 插件提供别名：`alias se='switch-env'`，以下示例中 `se` 与 `switch-env` 等价。
+- zsh 插件提供 `se()` 包装函数（不是简单 alias）：`se use`/`se auto` 会自动补齐 `--shell --notify`，`se deactivate` 会自动补齐 `--shell`。
 
 ### 全局参数（适用于所有子命令）
 
@@ -204,7 +204,7 @@ switch-env --dry-run use
 
 为保证“执行命令立刻生效”且输出简洁，`switch-env` 将“给人看的摘要”与“给 shell 执行的命令”分层：
 
-- **默认模式（交互）**：`switch-env use` / `se use` 只输出简洁彩色摘要（不输出可执行命令片段）；zsh 插件会自动让切换立刻生效。
+- **默认模式（交互）**：直接执行 `switch-env use` 会输出简洁彩色摘要（不输出可执行命令片段）；通过插件函数执行 `se use` 时，会自动走 `--shell --notify` 完成切换并显示提示。
 - **机器通道（推荐）**：`--shell` 模式会在 stdout 输出**纯 shell 片段**（多行），可直接 `eval`；成功时 stdout 只包含 shell，且不会混入 `INFO/WARN/OK` 文本。
 
 示例：
@@ -234,6 +234,7 @@ eval "$(switch-env deactivate --shell)"
 
 - `switch-env doctor > doctor.out 2> doctor.err` 时，表格在 `doctor.out`，提示在 `doctor.err`。
 - `switch-env use --shell` / `switch-env auto --shell` 的 `stdout` 保持可 `eval` 的纯 shell 内容，不混入日志文本。
+- `switch-env auto --shell --notify` 会将“给人看的提示”输出到 `stderr`，即使外层用 `$(...)` 捕获 `stdout`，提示仍会显示在终端。
 
 ### 1) `use`：智能切换/激活当前目录环境
 
@@ -665,6 +666,7 @@ git push origin v1.0.0
 | 进入目录无切换感知 | `switch-env auto --shell` | 插件未接管或契约未触发 | 确认 `.zshrc` 已加载 plugin，重新 `source ~/.zshrc` |
 | `auto --shell` 无输出 | `switch-env resolve` | 未找到 `.switch-env` 或无可切换项 | 补齐契约文件，或检查目录层级 |
 | `auto --shell` 只告警不执行 | `switch-env trust && switch-env auto --shell` | 契约未信任或内容已变更失信 | 重新 `trust` 当前契约 |
+| `node/python` 包装器偶发失效或行为异常 | `echo "$SWITCH_ENV_EXECUTING"` | 锁变量异常残留 | 重新加载插件后重试，升级到最新版本以获得异常安全释放 |
 
 ---
 

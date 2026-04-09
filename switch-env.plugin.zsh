@@ -12,6 +12,33 @@ _switch_env_eval_ipc() {
   done <<< "$out"
 }
 
+# 锁包裹执行：保证任何情况下都能释放 SWITCH_ENV_EXECUTING
+_switch_env_with_lock_capture() {
+  local __cmd="$1"
+  local __out_var="$2"
+  local __out
+  {
+    export SWITCH_ENV_EXECUTING=1
+    __out="$(eval "$__cmd")"
+  } always {
+    unset SWITCH_ENV_EXECUTING
+  }
+  typeset -g "$__out_var=$__out"
+}
+
+# 参数去重：避免重复拼接 --shell/--notify
+_switch_env_has_flag() {
+  local want="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == "$want" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # 2. 目录切换钩子 (无缝、无静默吞噬)
 _switch_env_chpwd() {
   local new_root old_root="$SWITCH_ENV_PROJECT_ROOT"
@@ -35,9 +62,7 @@ _switch_env_chpwd() {
   if [[ -n "$old_root" ]]; then
     export SWITCH_ENV_PROJECT_ROOT=""
     local deact_out
-    export SWITCH_ENV_EXECUTING=1 # 防止无限递归锁
-    deact_out="$(switch-env deactivate)"
-    unset SWITCH_ENV_EXECUTING
+    _switch_env_with_lock_capture "switch-env deactivate --shell" deact_out
     _switch_env_eval_ipc "$deact_out"
   fi
 
@@ -45,10 +70,8 @@ _switch_env_chpwd() {
   if [[ -n "$new_root" ]]; then
     export SWITCH_ENV_PROJECT_ROOT="$new_root"
     local use_out
-    export SWITCH_ENV_EXECUTING=1
     # 核心修复：绝不加 2>/dev/null，让 stderr 自由输出到屏幕
-    use_out="$(switch-env auto --shell --notify)"
-    unset SWITCH_ENV_EXECUTING
+    _switch_env_with_lock_capture "switch-env auto --shell --notify" use_out
     _switch_env_eval_ipc "$use_out"
   fi
 }
@@ -59,11 +82,24 @@ add-zsh-hook chpwd _switch_env_chpwd
 
 # 3. 提供 se 快捷命令 (手动触发)
 se() {
-  if [[ "$1" == "use" || "$1" == "auto" || "$1" == "deactivate" ]]; then
+  if [[ "$1" == "use" || "$1" == "auto" ]]; then
     local out
-    export SWITCH_ENV_EXECUTING=1
-    out="$(switch-env "$@")"
-    unset SWITCH_ENV_EXECUTING
+    local -a argv=("$@")
+    if ! _switch_env_has_flag "--shell" "${argv[@]}"; then
+      argv+=("--shell")
+    fi
+    if ! _switch_env_has_flag "--notify" "${argv[@]}"; then
+      argv+=("--notify")
+    fi
+    _switch_env_with_lock_capture "switch-env ${(@q)argv}" out
+    _switch_env_eval_ipc "$out"
+  elif [[ "$1" == "deactivate" ]]; then
+    local out
+    local -a argv=("$@")
+    if ! _switch_env_has_flag "--shell" "${argv[@]}"; then
+      argv+=("--shell")
+    fi
+    _switch_env_with_lock_capture "switch-env ${(@q)argv}" out
     _switch_env_eval_ipc "$out"
   else
     # doctor, status, list 等直接运行
@@ -85,9 +121,7 @@ _switch_env_wrap_cmd() {
   if [[ -z "$SWITCH_ENV_LAZY_DONE" ]]; then
       export SWITCH_ENV_LAZY_DONE=1
       local out
-      export SWITCH_ENV_EXECUTING=1
-      out="$(switch-env __hook --ensure --ensure-venv)"
-      unset SWITCH_ENV_EXECUTING
+      _switch_env_with_lock_capture "switch-env __hook --ensure --ensure-venv" out
       _switch_env_eval_ipc "$out"
   fi
   command "$cmd" "$@"
