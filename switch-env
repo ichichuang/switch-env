@@ -785,6 +785,11 @@ class EnvResolver:
                         return ResolvedNodeEnv(raw_version=raw, parsed=sv, source_file=p.name)
         return None
 
+    def _default_py_manager(self, spec: ProjectSpec) -> str:
+        if self.cfg.py_manager in ("pyenv", "conda"):
+            return self.cfg.py_manager
+        return "conda" if spec.kind == "conda" else "pyenv"
+
 
 def resolve_project_root_by_markers(cwd: Path) -> Optional[Path]:
     """向上查找可能的项目根目录（基于常见标识文件），用于 auto 的无契约降级。"""
@@ -810,11 +815,6 @@ def resolve_project_root_by_markers(cwd: Path) -> Optional[Path]:
         if cur.parent == cur:
             return None
         cur = cur.parent
-
-    def _default_py_manager(self, spec: ProjectSpec) -> str:
-        if self.cfg.py_manager in ("pyenv", "conda"):
-            return self.cfg.py_manager
-        return "conda" if spec.kind == "conda" else "pyenv"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1272,12 +1272,15 @@ class UseCommand(Command):
         spec = detect_project(ctx.cwd)
         activated_something = False
         want_shell = bool(getattr(args, "shell", False))
+        want_notify = bool(getattr(args, "notify", False))
         shell_cmds: List[str] = []
         want_verbose = bool(getattr(args, "verbose", False))
 
         py_summary: Optional[str] = None
         node_summary: Optional[str] = None
         warnings: List[str] = []
+        notify_msgs: List[str] = []
+        source_markers: List[str] = []
 
         # ── Python ──
         py_resolved = ctx.resolver.resolve_python(spec)
@@ -1311,6 +1314,9 @@ class UseCommand(Command):
                 plan = mgr.activation_plan(ctx.cwd, venv_path, env_ref)
                 if want_shell:
                     shell_cmds.extend(plan.shell_cmds)
+                    if plan.kind == "shell_cmd" and plan.shell_cmds:
+                        notify_msgs.append(f"Python={pyver or env_ref}")
+                        source_markers.append(py_resolved.source_file)
                 else:
                     if want_verbose:
                         _emit_ipc(plan)
@@ -1345,6 +1351,9 @@ class UseCommand(Command):
                     plan = nmgr.switch_plan(use_ver)
                     if want_shell:
                         shell_cmds.extend(plan.shell_cmds)
+                        if plan.kind == "shell_cmd" and plan.shell_cmds:
+                            notify_msgs.append(f"Node={use_ver}")
+                            source_markers.append(node_resolved.source_file)
                     else:
                         if want_verbose:
                             _emit_ipc(plan)
@@ -1359,7 +1368,10 @@ class UseCommand(Command):
         if want_shell:
             if shell_cmds:
                 print(_render_shell_cmds(shell_cmds))
-                return 0
+            if want_notify and notify_msgs:
+                unique_sources = ", ".join(sorted(set(source_markers))) if source_markers else "project markers"
+                msg = " ".join(notify_msgs)
+                err_console.print(f"[green]✓[/green] switch-env: {msg} (from {unique_sources})")
             return 0
 
         if warnings and want_verbose:
@@ -1873,8 +1885,9 @@ class AutoCommand(Command):
                         parts.append(f"Node={contract.values.get('node')}")
                     if "env_file" in contract.values:
                         parts.append(f"env={contract.values.get('env_file')}")
+                    proj = contract.project_root.name
                     msg = " ".join(parts) if parts else "activated"
-                    err_console.print(f"[bold green]✓ switch-env:[/bold green] {msg}")
+                    err_console.print(f"[green]✓[/green] switch-env: {msg} (from .switch-env, project={proj})")
                 return 0
 
             ctx.log.success(f"已解析契约: {contract.file_path}")
@@ -1944,8 +1957,9 @@ class AutoCommand(Command):
             if out.strip():
                 print(out)
             if want_notify and notify_msgs:
+                unique_sources = ", ".join(sorted(set(source_markers))) if source_markers else "project markers"
                 msg = " ".join(notify_msgs)
-                err_console.print(f"[bold green]✓ switch-env:[/bold green] {msg}")
+                err_console.print(f"[green]✓[/green] switch-env: {msg} (from {unique_sources})")
             return 0
 
         # 非 shell 模式：人类可读（尽量简洁）
@@ -2147,6 +2161,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_use.add_argument("--no-install", action="store_true", help="不自动安装。")
     p_use.add_argument("--clean-cache", action="store_true")
     p_use.add_argument("--shell", action="store_true", help="输出可 eval 的纯 shell 命令（stdout 仅此内容）。")
+    p_use.add_argument("--notify", action="store_true", help="仅在发生切换/激活时输出一行提示（stderr）。")
 
     # status
     sub.add_parser("status", help=StatusCommand.help)
