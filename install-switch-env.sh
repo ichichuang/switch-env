@@ -665,3 +665,6 @@ case "${1:-}" in
     do_install
     ;;
 esac
+
+# 单文件安装包在脚本末尾追加 base64 载荷；此处必须退出，避免继续解析 @@FILE: 行
+exit 0
