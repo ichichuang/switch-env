@@ -92,6 +92,7 @@ switch-env auto --shell
 - Python 决策层会先构建 `RuntimePlan`（结构化计划对象）。
 - `switch-env auto --json`：输出结构化 JSON，便于审计与调试。
 - `switch-env auto --shell`：基于计划渲染 shell-safe 命令，供 plugin `eval` 执行。
+- `switch-env auto --notify`：仅在发生实际切换/激活时输出一行提示（走 stderr，不污染 `--shell` 的 stdout）。
 - 未授权契约时默认安全 no-op：`--shell` 不输出命令到 stdout，仅在 stderr 提示需先 `trust`。
 
 示例：
@@ -99,6 +100,7 @@ switch-env auto --shell
 ```bash
 switch-env auto --json
 switch-env auto --shell
+switch-env auto --shell --notify
 ```
 
 ### `.switch-env` 示例

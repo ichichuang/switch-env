@@ -76,6 +76,21 @@ switch-env() {
   esac
 }
 
+# ─── auto: 捕获 notify 并展示 ────────────────────────────────────────────────
+_switch_env_eval_auto() {
+  local out err
+  out="$(mktemp)"
+  err="$(mktemp)"
+  command switch-env auto --shell --notify >"$out" 2>"$err"
+  if [[ -s "$out" ]]; then
+    eval "$(<"$out")"
+  fi
+  if [[ -s "$err" ]]; then
+    print -r -- "$(<"$err")"
+  fi
+  rm -f "$out" "$err"
+}
+
 # ─── 核心 chpwd 钩子 ─────────────────────────────────────────────────────────
 
 _switch_env_chpwd() {
@@ -107,7 +122,7 @@ _switch_env_chpwd() {
     export SWITCH_ENV_LAZY_DONE=""  # 新项目，重置懒加载
 
     # 新架构：自动契约引擎（shell-safe 输出）
-    eval "$(switch-env auto --shell 2>/dev/null)"
+    _switch_env_eval_auto
 
     # 标记由 auto 推断触发
     export SWITCH_ENV_PY_ACTIVE=1
@@ -131,7 +146,7 @@ _switch_env_lazy_activate() {
   fi
 
   # v1: 统一走 auto 契约入口
-  eval "$(switch-env auto --shell 2>/dev/null)"
+  _switch_env_eval_auto
 
   export SWITCH_ENV_LAZY_DONE=1
 }

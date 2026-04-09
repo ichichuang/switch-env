@@ -31,6 +31,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 console = Console()
+console_err = Console(stderr=True)
 
 # ─── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -1802,6 +1803,7 @@ class AutoCommand(Command):
     def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
         want_shell = bool(getattr(args, "shell", False))
         want_json = bool(getattr(args, "json", False))
+        want_notify = bool(getattr(args, "notify", False))
         if want_shell and want_json:
             raise SwitchEnvError("`auto` 不能同时使用 --shell 与 --json。")
 
@@ -1830,6 +1832,17 @@ class AutoCommand(Command):
             out = plan_json_to_shell(plan_json)
             if out.strip():
                 print(out)
+            if want_notify and plan.action == "apply" and (plan.commands or plan.env):
+                parts: List[str] = []
+                if "python" in contract.values:
+                    parts.append(f"Python={contract.values.get('python')}")
+                if "node" in contract.values:
+                    parts.append(f"Node={contract.values.get('node')}")
+                if "env_file" in contract.values:
+                    parts.append(f"env={contract.values.get('env_file')}")
+                proj = contract.project_root.name
+                msg = " ".join(parts) if parts else "activated"
+                console_err.print(f"[green]✓[/green] switch-env: {msg} (project={proj})")
             return 0
         ctx.log.success(f"已解析契约: {contract.file_path}")
         ctx.log.info(f"project_root={contract.project_root}")
@@ -2078,6 +2091,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_auto = sub.add_parser("auto", help=AutoCommand.help)
     p_auto.add_argument("--shell", action="store_true", help="输出 shell 可执行命令（供插件 eval）")
     p_auto.add_argument("--json", action="store_true", help="输出结构化 RuntimePlan JSON（供审计/调试）")
+    p_auto.add_argument("--notify", action="store_true", help="仅在发生切换/激活时输出一行提示（stderr）。")
 
     # repair
     sub.add_parser("repair", help=RepairCommand.help)
