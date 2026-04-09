@@ -69,6 +69,11 @@ DEBUG_INSTALL_MODE=1 QUIET=0 bash ./install-switch-env.sh
 SWITCH_ENV_DEBUG=1 QUIET=0 bash ./install-switch-env.sh
 ```
 
+### 单文件安装器末尾 `@@FILE:` 报错（已修复）
+
+若安装流程已全部成功，但在**最后一行**出现 `@@FILE:switch-env: command not found`，原因是旧版单文件安装包在脚本主体结束后仍继续解析后面的内嵌载荷标记行。  
+请升级到包含该修复的 Release 后重新安装：主安装脚本在正常结束时会 `exit 0`，不再误执行 `@@FILE:` 行。
+
 ---
 
 ## 项目契约自动切换（Project Runtime Orchestration v1）
@@ -194,8 +199,10 @@ switch-env --dry-run use
 
 ### 输出协议：`__SWITCH_ENV_CMD__` 与 `auto --shell`
 
-- **`use`、`deactivate`、`bootstrap`（及部分管理器激活）**：在标准输出中打印形如 `__SWITCH_ENV_CMD__:<shell 命令>` 的行；**zsh 插件**会捕获这些行并 `eval` 对应命令。若你在脚本中直接调用，请同样解析该前缀或改用 `source` 配合插件文档。
-- **`auto --shell`**：直接输出**可执行的 shell 脚本片段**（多行 `export` / `if` 等），**不带** `__SWITCH_ENV_CMD__:` 前缀，供 `eval "$(switch-env auto --shell)"` 使用。
+- **`use`、`deactivate`、`bootstrap`（及部分管理器激活）**：在标准输出中打印形如 `__SWITCH_ENV_CMD__:<shell 命令>`（及兼容前缀 `__SWITCH_PY_ACTIVATE_CMD__:`）的行。子进程无法修改父 shell，因此需要由 shell 侧解析并 `eval`。
+- **交互式 zsh（已加载本仓库插件）**：插件将 `switch-env` / `se` 实现为**函数**，对 `use`、`bootstrap`、`deactivate`、`__hook` 会读取 CLI 的标准输出并在**当前会话**中执行 IPC 行；对 `auto --shell` 使用 `eval "$(command switch-env …)"`，因此你在终端里执行 `se use` 后，`nvm` / `pyenv` 等会**立即生效**。`chpwd` 里对 `deactivate` 仍使用 `command switch-env` 捕获输出再在父 shell 中 eval，避免命令替换子 shell 无法改环境的问题。
+- **未加载插件或直接调用 `~/bin/switch-env` 二进制**：不会自动 `eval`，需自行解析 `__SWITCH_ENV_CMD__:` 行或使用 `eval` 配合文档。**bash** 用户当前无同等包装，可改用 zsh 或按行解析 IPC。
+- **`auto --shell`**：直接输出**可执行的 shell 脚本片段**（多行 `export` / `if` 等），**不带** `__SWITCH_ENV_CMD__:` 前缀，供 `eval "$(switch-env auto --shell)"` 使用（插件内已统一如此）。
 - **`auto --json`**：输出单行 JSON，对应内部 `RuntimePlan`（字段含 `action`、`env`、`commands`、`meta`）；与 `--shell` **互斥**，不可同一次调用。
 
 ### 1) `use`：智能切换/激活当前目录环境
