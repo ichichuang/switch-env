@@ -197,13 +197,28 @@ switch-env --verbose doctor
 switch-env --dry-run use
 ```
 
-### 输出协议：`__SWITCH_ENV_CMD__` 与 `auto --shell`
+### 输出协议：`--shell`（推荐）与 `auto --shell`
 
-- **`use`、`deactivate`、`bootstrap`（及部分管理器激活）**：在标准输出中打印形如 `__SWITCH_ENV_CMD__:<shell 命令>`（及兼容前缀 `__SWITCH_PY_ACTIVATE_CMD__:`）的行。子进程无法修改父 shell，因此需要由 shell 侧解析并 `eval`。
-- **交互式 zsh（已加载本仓库插件）**：插件将 `switch-env` / `se` 实现为**函数**，对 `use`、`bootstrap`、`deactivate`、`__hook` 会读取 CLI 的标准输出并在**当前会话**中执行 IPC 行；对 `auto --shell` 使用 `eval "$(command switch-env …)"`，因此你在终端里执行 `se use` 后，`nvm` / `pyenv` 等会**立即生效**。`chpwd` 里对 `deactivate` 仍使用 `command switch-env` 捕获输出再在父 shell 中 eval，避免命令替换子 shell 无法改环境的问题。
-- **未加载插件或直接调用 `~/bin/switch-env` 二进制**：不会自动 `eval`，需自行解析 `__SWITCH_ENV_CMD__:` 行或使用 `eval` 配合文档。**bash** 用户当前无同等包装，可改用 zsh 或按行解析 IPC。
-- **`auto --shell`**：直接输出**可执行的 shell 脚本片段**（多行 `export` / `if` 等），**不带** `__SWITCH_ENV_CMD__:` 前缀，供 `eval "$(switch-env auto --shell)"` 使用（插件内已统一如此）。
-- **`auto --json`**：输出单行 JSON，对应内部 `RuntimePlan`（字段含 `action`、`env`、`commands`、`meta`）；与 `--shell` **互斥**，不可同一次调用。
+为保证“执行命令立刻生效”且输出简洁，`switch-env` 将“给人看的摘要”与“给 shell 执行的命令”分层：
+
+- **默认模式（交互）**：`switch-env use` / `se use` 只输出简洁彩色摘要（不输出可执行命令片段）；zsh 插件会自动让切换立刻生效。
+- **机器通道（推荐）**：`--shell` 模式会在 stdout 输出**纯 shell 片段**（多行），可直接 `eval`；成功时 stdout 只包含 shell，且不会混入 `INFO/WARN/OK` 文本。
+
+示例：
+
+```bash
+eval "$(switch-env use --shell)"
+eval "$(switch-env bootstrap --shell)"
+eval "$(switch-env deactivate --shell)"
+```
+
+- **`auto --shell`**：输出项目契约引擎生成的纯 shell 片段（与上面一致，可 `eval`）。
+- **`auto --json`**：输出单行 JSON（`RuntimePlan`），与 `--shell` 互斥。
+
+说明：
+
+- 若未加载 zsh 插件，直接执行 `switch-env use` 不会修改父 shell 环境；请改用 `eval "$(switch-env use --shell)"`。
+- 旧版 IPC 前缀 `__SWITCH_ENV_CMD__:` 仅用于历史兼容，不建议在新脚本中继续依赖。
 
 ### 1) `use`：智能切换/激活当前目录环境
 
