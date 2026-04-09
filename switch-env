@@ -832,7 +832,7 @@ def _write_project_env_file(project_root: Path, manager: str, env_ref: str, dry_
     content = f"manager:{manager}\n"
     content += f"version:{env_ref}\n" if manager == "pyenv" else f"env_name:{env_ref}\n"
     if dry_run:
-        console.print(f"[cyan]INFO[/cyan]  [dry-run] 写入 {p}:\n{content}")
+        err_console.print(f"[cyan]INFO[/cyan]  [dry-run] 写入 {p}:\n{content}")
         return
     p.write_text(content, encoding="utf-8")
 
@@ -907,7 +907,7 @@ def clean_pycache(dir_path: str) -> None:
                     count += 1
                 except Exception:
                     pass
-    console.print(f"[green]已删除约 {count} 个缓存文件/目录[/green]")
+    err_console.print(f"[green]已删除约 {count} 个缓存文件/目录[/green]")
 
 
 class progress_scope:
@@ -1367,7 +1367,9 @@ class UseCommand(Command):
                 ctx.log.warn(w)
 
         if getattr(args, "clean_cache", False):
-            clean_pycache(str(ctx.cwd))
+            # shell 模式下 stdout 必须保持纯机器命令，不输出人类文本
+            if not want_shell:
+                clean_pycache(str(ctx.cwd))
 
         # 默认输出：结果卡片（简洁）
         if py_summary:
