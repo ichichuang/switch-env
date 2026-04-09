@@ -18,8 +18,10 @@ jobs:
 
       - name: Build installer shell package
         run: |
+          chmod +x ./install.sh
           chmod +x ./install-switch-env.sh
           AUTO_YES=1 ./install-switch-env.sh --build switch-env-installer.sh
+          chmod +x ./install.sh
           chmod +x ./switch-env-installer.sh
 
       - name: Ensure command launcher executable
@@ -28,12 +30,13 @@ jobs:
 
       - name: Generate checksums
         run: |
-          sha256sum switch-env-installer.sh switch-env-installer.command > sha256.txt
+          sha256sum install.sh switch-env-installer.sh switch-env-installer.command > sha256.txt
 
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            install.sh
             switch-env-installer.sh
             switch-env-installer.command
             sha256.txt

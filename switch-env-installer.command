@@ -2,8 +2,8 @@
 set -u
 
 REPO_URL="https://github.com/ichichuang/switch-env"
-INSTALLER_URL="${REPO_URL}/releases/latest/download/switch-env-installer.sh"
-INSTALLER_NAME="switch-env-installer.sh"
+BOOTSTRAP_URL="${REPO_URL}/releases/latest/download/install.sh"
+BOOTSTRAP_NAME="install.sh"
 
 echo "======================================"
 echo "      switch-env 一键安装程序"
@@ -13,39 +13,39 @@ echo "仓库: ${REPO_URL}"
 echo ""
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALLER_PATH="${DIR}/${INSTALLER_NAME}"
+BOOTSTRAP_PATH="${DIR}/${BOOTSTRAP_NAME}"
 
-download_installer() {
-  echo "正在下载安装器..."
+download_bootstrap() {
+  echo "正在下载安装入口脚本..."
   if command -v curl >/dev/null 2>&1; then
-    curl -fL --connect-timeout 15 --retry 2 --retry-delay 2 -o "${INSTALLER_PATH}" "${INSTALLER_URL}"
+    curl -fL --connect-timeout 15 --retry 2 --retry-delay 2 -o "${BOOTSTRAP_PATH}" "${BOOTSTRAP_URL}"
     return $?
   fi
-  echo "错误: 未找到 curl，无法下载安装器。"
+  echo "错误: 未找到 curl，无法下载安装入口脚本。"
   return 127
 }
 
-if [[ ! -f "${INSTALLER_PATH}" ]]; then
-  if ! download_installer; then
+if [[ ! -f "${BOOTSTRAP_PATH}" ]]; then
+  if ! download_bootstrap; then
     code=$?
     echo ""
-    echo "下载安装器失败 (exit code: ${code})"
+    echo "下载安装入口失败 (exit code: ${code})"
     echo "请检查网络/代理后重试，或手动下载："
-    echo "  ${INSTALLER_URL}"
+    echo "  ${BOOTSTRAP_URL}"
     echo ""
     read -n 1 -s -r -p "按任意键退出..."
     echo ""
     exit "${code}"
   fi
 else
-  echo "检测到本地安装器: ${INSTALLER_PATH}"
+  echo "检测到本地安装入口: ${BOOTSTRAP_PATH}"
 fi
 
-chmod +x "${INSTALLER_PATH}" 2>/dev/null || true
+chmod +x "${BOOTSTRAP_PATH}" 2>/dev/null || true
 
 echo ""
 echo "开始执行安装..."
-bash "${INSTALLER_PATH}"
+AUTO_YES=1 bash "${BOOTSTRAP_PATH}"
 install_code=$?
 
 echo ""
