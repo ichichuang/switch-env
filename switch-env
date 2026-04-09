@@ -39,6 +39,12 @@ PROJECT_ENV_FILE = ".switch-py-env"       # 兼容旧 switch-py
 PROJECT_UNIFIED_FILE = ".switch-env"      # 新统一配置
 PROJECT_CACHE_DIR = ".switch-py-cache"
 PROJECT_HASH_LOCK = "hash.lock"
+INSTALL_BIN_DIRNAME = "bin"
+INSTALL_META_DIRNAME = ".switch-env"
+INSTALL_META_FILENAME = "meta"
+INSTALL_PLUGIN_NAME = "switch-env.plugin.zsh"
+INSTALL_BIN_NAME = "switch-env"
+INSTALLER_LATEST_URL = "https://github.com/ichichuang/switch-env/releases/latest/download/switch-env-installer.sh"
 
 PYENV_CMD = "pyenv"
 CONDA_CMD = "conda"
@@ -869,6 +875,121 @@ class AppContext:
     resolver: EnvResolver
 
 
+@dataclass(frozen=True)
+class InstallState:
+    mode: str                         # fresh | update | conflict
+    score: int
+    has_meta: bool
+    has_bin_fingerprint: bool
+    has_plugin_fingerprint: bool
+    has_shebang: bool
+    has_version_marker: bool
+    has_bin_file: bool
+    has_plugin_file: bool
+
+
+def _contains_literal(path: Path, literal: str) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        return literal in path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+
+
+def _first_line(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            return f.readline().rstrip("\n")
+    except Exception:
+        return ""
+
+
+def detect_install_state(home: Path, logger: Logger, debug: bool = False) -> InstallState:
+    bin_dir = home / INSTALL_BIN_DIRNAME
+    meta_file = home / INSTALL_META_DIRNAME / INSTALL_META_FILENAME
+    target_bin = bin_dir / INSTALL_BIN_NAME
+    target_plugin = bin_dir / INSTALL_PLUGIN_NAME
+    expected_shebang = f"#!{home / '.venv-tools' / 'bin' / 'python'}"
+
+    has_bin_file = target_bin.exists()
+    has_plugin_file = target_plugin.exists()
+    has_meta_file = meta_file.exists()
+
+    if not has_bin_file and not has_plugin_file and not has_meta_file:
+        if debug:
+            logger.debug("install-state: fresh (no bin/plugin/meta)")
+        return InstallState(
+            mode="fresh",
+            score=0,
+            has_meta=False,
+            has_bin_fingerprint=False,
+            has_plugin_fingerprint=False,
+            has_shebang=False,
+            has_version_marker=False,
+            has_bin_file=False,
+            has_plugin_file=False,
+        )
+
+    has_meta = (
+        _contains_literal(meta_file, "installed_by=switch-env-installer")
+        and _contains_literal(meta_file, "repo_url=https://github.com/ichichuang/switch-env")
+        and _contains_literal(meta_file, "meta_version=")
+        and _contains_literal(meta_file, "signature=switch-env")
+    )
+    has_bin_fingerprint = (
+        _contains_literal(target_bin, "switch-env: 统一的多运行时环境自动化引擎。")
+        and _contains_literal(target_bin, "__SWITCH_ENV_CMD__")
+    )
+    has_plugin_fingerprint = (
+        _contains_literal(target_plugin, "_switch_env_chpwd")
+        and _contains_literal(target_plugin, "autoload -U add-zsh-hook")
+        and _contains_literal(target_plugin, "add-zsh-hook chpwd _switch_env_chpwd")
+        and _contains_literal(target_plugin, "switch-env.plugin.zsh")
+    )
+    has_shebang = _first_line(target_bin).startswith(expected_shebang)
+    has_version_marker = _contains_literal(target_bin, "__SWITCH_ENV_VERSION__")
+
+    score = 0
+    if has_meta:
+        score += 3
+        if debug:
+            logger.debug("install-state: meta +3")
+    if has_bin_fingerprint:
+        score += 2
+        if debug:
+            logger.debug("install-state: bin +2")
+    if has_plugin_fingerprint:
+        score += 2
+        if debug:
+            logger.debug("install-state: plugin +2")
+    if has_shebang:
+        score += 1
+        if debug:
+            logger.debug("install-state: shebang +1")
+    if has_version_marker:
+        score += 1
+        if debug:
+            logger.debug("install-state: version +1")
+    if debug:
+        logger.debug(f"install-state: total={score}")
+
+    mode = "update" if score >= 4 else "conflict"
+    return InstallState(
+        mode=mode,
+        score=score,
+        has_meta=has_meta,
+        has_bin_fingerprint=has_bin_fingerprint,
+        has_plugin_fingerprint=has_plugin_fingerprint,
+        has_shebang=has_shebang,
+        has_version_marker=has_version_marker,
+        has_bin_file=has_bin_file,
+        has_plugin_file=has_plugin_file,
+    )
+
+
 class Command(ABC):
     name: str
     help: str
@@ -1059,7 +1180,27 @@ class DoctorCommand(Command):
         else:
             ok("PATH 优先级", "pyenv/shims 优先于 conda (或无冲突)")
 
+        # install-state
+        install_state = detect_install_state(ctx.home, ctx.log, debug=bool(getattr(args, "verbose", False)))
+        install_mode_str = {
+            "fresh": "[dim]fresh[/dim]",
+            "update": "[green]update[/green]",
+            "conflict": "[yellow]conflict[/yellow]",
+        }.get(install_state.mode, install_state.mode)
+        table.add_row("install-mode", install_mode_str, f"score={install_state.score}")
+        table.add_row("install-meta", "[green]OK[/green]" if install_state.has_meta else "[red]MISS[/red]", str(ctx.home / INSTALL_META_DIRNAME / INSTALL_META_FILENAME))
+        table.add_row("install-bin", "[green]OK[/green]" if install_state.has_bin_fingerprint else "[red]MISS[/red]", str(ctx.home / INSTALL_BIN_DIRNAME / INSTALL_BIN_NAME))
+        table.add_row("install-plugin", "[green]OK[/green]" if install_state.has_plugin_fingerprint else "[red]MISS[/red]", str(ctx.home / INSTALL_BIN_DIRNAME / INSTALL_PLUGIN_NAME))
+        table.add_row("install-shebang", "[green]OK[/green]" if install_state.has_shebang else "[yellow]WARN[/yellow]", "expect ~/.venv-tools/bin/python")
+        table.add_row("install-version-marker", "[green]OK[/green]" if install_state.has_version_marker else "[dim]N/A[/dim]", "__SWITCH_ENV_VERSION__")
+
         console.print(table)
+        if install_state.mode == "fresh":
+            ctx.log.info("建议动作: 运行安装器完成首次安装。")
+        elif install_state.mode == "conflict":
+            ctx.log.warn("建议动作: 先执行 `switch-env repair`，确认后再升级。")
+        else:
+            ctx.log.success("建议动作: 状态正常，可执行 `switch-env upgrade`。")
         return 0
 
 
@@ -1242,6 +1383,107 @@ class CleanCommand(Command):
         return 0
 
 
+class RepairCommand(Command):
+    name = "repair"
+    help = "修复 switch-env 安装态异常（meta/shebang 等）。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        st = detect_install_state(ctx.home, ctx.log, debug=bool(getattr(args, "verbose", False)))
+        bin_dir = ctx.home / INSTALL_BIN_DIRNAME
+        target_bin = bin_dir / INSTALL_BIN_NAME
+        target_plugin = bin_dir / INSTALL_PLUGIN_NAME
+        meta_dir = ctx.home / INSTALL_META_DIRNAME
+        meta_file = meta_dir / INSTALL_META_FILENAME
+        expected_shebang = f"#!{ctx.home / '.venv-tools' / 'bin' / 'python'}"
+
+        if st.mode == "fresh":
+            ctx.log.info("未检测到安装痕迹，无需 repair。")
+            return 0
+        if st.mode == "update":
+            ctx.log.success("当前安装状态正常，无需 repair。")
+            return 0
+
+        # conflict path
+        if not target_bin.exists():
+            ctx.log.error(f"缺失主程序: {target_bin}")
+            ctx.log.info("请先重新运行官方安装器恢复文件。")
+            return 1
+        if not st.has_bin_fingerprint:
+            ctx.log.error("检测到同名但非官方 switch-env 主程序，自动修复已中止。")
+            ctx.log.info("请确认来源后手动处理，或使用官方安装器覆盖安装。")
+            return 1
+
+        # fix shebang
+        if not st.has_shebang:
+            ctx.log.warn("检测到 shebang 异常，开始修复。")
+            if not ctx.shell.dry_run:
+                content = target_bin.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if content:
+                    content[0] = expected_shebang
+                else:
+                    content = [expected_shebang]
+                target_bin.write_text("\n".join(content) + "\n", encoding="utf-8")
+            ctx.log.success("shebang 修复完成。")
+
+        # rebuild meta
+        if not st.has_meta:
+            ctx.log.warn("检测到安装元数据缺失/损坏，开始重建。")
+            if not ctx.shell.dry_run:
+                meta_dir.mkdir(parents=True, exist_ok=True)
+                meta_file.write_text(
+                    "\n".join(
+                        [
+                            "installed_by=switch-env-installer",
+                            "repo_url=https://github.com/ichichuang/switch-env",
+                            "meta_version=1",
+                            "signature=switch-env-official",
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            ctx.log.success("meta 重建完成。")
+
+        if not target_plugin.exists() or not st.has_plugin_fingerprint:
+            ctx.log.warn("plugin 缺失或异常。")
+            ctx.log.info("建议重新运行官方安装器以恢复 plugin：")
+            ctx.log.info(f"curl -fsSL {INSTALLER_LATEST_URL} | AUTO_YES=1 bash")
+
+        post = detect_install_state(ctx.home, ctx.log, debug=bool(getattr(args, "verbose", False)))
+        if post.mode == "update":
+            ctx.log.success("repair 完成，安装态已恢复为 update。")
+            return 0
+        ctx.log.warn(f"repair 完成，但当前模式仍为 {post.mode}，请按提示重新安装。")
+        return 1
+
+
+class UpgradeCommand(Command):
+    name = "upgrade"
+    help = "升级到 switch-env 最新发布版本。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        st = detect_install_state(ctx.home, ctx.log, debug=bool(getattr(args, "verbose", False)))
+        if st.mode == "conflict":
+            ctx.log.error("检测到冲突状态，升级已中止。请先执行 `switch-env repair`。")
+            return 1
+
+        cmd = f"curl -fsSL {INSTALLER_LATEST_URL} | AUTO_YES=1 bash"
+        ctx.log.info(f"执行升级: {cmd}")
+        res = ctx.shell.run(cmd, check=False)
+        if res.returncode != 0:
+            ctx.log.error("升级失败，请检查网络/权限后重试。")
+            if res.stderr.strip():
+                ctx.log.error(res.stderr.strip())
+            return res.returncode
+
+        post = detect_install_state(ctx.home, ctx.log, debug=bool(getattr(args, "verbose", False)))
+        if post.mode == "update":
+            ctx.log.success("升级完成，当前安装态为 update。")
+            return 0
+        ctx.log.warn(f"升级执行完成，但安装态为 {post.mode}。建议运行 `switch-env doctor` 查看详情。")
+        return 0
+
+
 # ─── __hook (internal, for zsh plugin) ────────────────────────────────────────
 
 class HookCommand(Command):
@@ -1364,6 +1606,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_clean.add_argument("-n", "--name", default=DEFAULT_VENV_NAME)
     p_clean.add_argument("-c", "--cache-only", action="store_true")
 
+    # repair
+    sub.add_parser("repair", help=RepairCommand.help)
+
+    # upgrade
+    sub.add_parser("upgrade", help=UpgradeCommand.help)
+
     # __hook (internal)
     p_hook = sub.add_parser("__hook", help=argparse.SUPPRESS)
     p_hook.add_argument("--ensure", action="store_true")
@@ -1380,6 +1628,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         c.name: c for c in [
             UseCommand(), StatusCommand(), DoctorCommand(), ListCommand(),
             BootstrapCommand(), DeactivateCommand(), InitCommand(), CleanCommand(),
+            RepairCommand(), UpgradeCommand(),
             HookCommand(),
         ]
     }
