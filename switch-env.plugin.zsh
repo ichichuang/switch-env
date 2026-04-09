@@ -39,8 +39,66 @@ _switch_env_eval_ipc() {
     if [[ "$line" == __SWITCH_ENV_CMD__:* ]]; then
       cmd="${line#__SWITCH_ENV_CMD__:}"
       eval "$cmd"
+    elif [[ "$line" == __SWITCH_PY_ACTIVATE_CMD__:* ]]; then
+      cmd="${line#__SWITCH_PY_ACTIVATE_CMD__:}"
+      eval "$cmd"
     fi
   done <<< "$output"
+}
+
+# 交互式：对 IPC 子命令捕获 stdout 后在当前 shell eval（避免管道子 shell）
+_switch_env_run_ipc_stream() {
+  local line tmp ret
+  tmp="$(mktemp)"
+  command switch-env "$@" >"$tmp"
+  ret=$?
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == __SWITCH_ENV_CMD__:* ]]; then
+      eval "${line#__SWITCH_ENV_CMD__:}"
+    elif [[ "$line" == __SWITCH_PY_ACTIVATE_CMD__:* ]]; then
+      eval "${line#__SWITCH_PY_ACTIVATE_CMD__:}"
+    else
+      print -r -- "$line"
+    fi
+  done <"$tmp"
+  rm -f "$tmp"
+  return ret
+}
+
+# 跳过全局参数后取第一个子命令名（用于分流）
+_switch_env_first_subcmd() {
+  local -a a
+  a=("$@")
+  local i s
+  for ((i = 1; i <= $#a; i++)); do
+    s="${a[i]}"
+    case "$s" in
+      -h | --help | --dry-run | --interactive | --verbose) continue ;;
+      -*) continue ;;
+      *) echo "$s"
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# 包装命令：IPC 子命令立即生效；auto --shell 与插件 chpwd 一致
+switch-env() {
+  local sub
+  if ! sub="$(_switch_env_first_subcmd "$@")"; then
+    command switch-env "$@"
+    return $?
+  fi
+
+  if [[ "$sub" == "auto" ]] && [[ -n ${(M)@:#--shell} ]]; then
+    eval "$(command switch-env "$@")"
+    return $?
+  fi
+
+  case "$sub" in
+    use | bootstrap | deactivate | __hook) _switch_env_run_ipc_stream "$@" ;;
+    *) command switch-env "$@" ;;
+  esac
 }
 
 # ─── 核心 chpwd 钩子 ─────────────────────────────────────────────────────────
@@ -62,7 +120,7 @@ _switch_env_chpwd() {
   # 3) 离开旧项目 → 去激活
   if [[ -n "$old_root" ]]; then
     local deact_out
-    deact_out="$(switch-env deactivate 2>/dev/null)"
+    deact_out="$(command switch-env deactivate 2>/dev/null)"
     _switch_env_eval_ipc "$deact_out"
     export SWITCH_ENV_PROJECT_ROOT=""
     export SWITCH_ENV_LAZY_DONE=""
