@@ -46,6 +46,8 @@ INSTALL_PLUGIN_NAME = "switch-env.plugin.zsh"
 INSTALL_BIN_NAME = "switch-env"
 INSTALLER_LATEST_URL = "https://github.com/ichichuang/switch-env/releases/latest/download/switch-env-installer.sh"
 BOOTSTRAP_LATEST_URL = "https://github.com/ichichuang/switch-env/releases/latest/download/install.sh"
+ALLOWLIST_FILENAME = "allowlist.json"
+CONTRACT_FILENAME = ".switch-env"
 
 PYENV_CMD = "pyenv"
 CONDA_CMD = "conda"
@@ -889,6 +891,21 @@ class InstallState:
     has_plugin_file: bool
 
 
+@dataclass(frozen=True)
+class ProjectContract:
+    file_path: Path
+    project_root: Path
+    values: Dict[str, str]
+
+
+@dataclass(frozen=True)
+class RuntimePlan:
+    action: str
+    env: Dict[str, str]
+    commands: List[str]
+    meta: Dict[str, str]
+
+
 def _contains_literal(path: Path, literal: str) -> bool:
     if not path.exists() or not path.is_file():
         return False
@@ -989,6 +1006,186 @@ def detect_install_state(home: Path, logger: Logger, debug: bool = False) -> Ins
         has_bin_file=has_bin_file,
         has_plugin_file=has_plugin_file,
     )
+
+
+def _allowlist_path(home: Path) -> Path:
+    return home / INSTALL_META_DIRNAME / ALLOWLIST_FILENAME
+
+
+def contract_content_hash(contract_file: Path) -> str:
+    content = contract_file.read_bytes()
+    return hashlib.sha256(content).hexdigest()
+
+
+def _load_allowlist(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def _save_allowlist(path: Path, records: List[Dict[str, str]], dry_run: bool, logger: Logger) -> None:
+    if dry_run:
+        logger.info(f"[dry-run] 写入 allowlist: {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def resolve_contract_file(cwd: Path) -> Optional[Path]:
+    cur = cwd.resolve()
+    while True:
+        candidate = cur / CONTRACT_FILENAME
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+
+
+_CONTRACT_KEY_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def parse_contract(contract_file: Path) -> ProjectContract:
+    values: Dict[str, str] = {}
+    lines = contract_file.read_text(encoding="utf-8", errors="strict").splitlines()
+    for idx, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise SwitchEnvError(f"无效配置行（缺少 '='）: {contract_file}:{idx}: {raw}")
+        key, value = line.split("=", 1)
+        if not _CONTRACT_KEY_RE.fullmatch(key):
+            raise SwitchEnvError(f"无效 key（仅允许 [a-z_][a-z0-9_]*）: {contract_file}:{idx}: {key}")
+        if "#" in value:
+            raise SwitchEnvError(f"不允许 inline comment: {contract_file}:{idx}: {raw}")
+        values[key] = value
+    return ProjectContract(file_path=contract_file.resolve(), project_root=contract_file.resolve().parent, values=values)
+
+
+def trust_contract(home: Path, contract_file: Path, dry_run: bool, logger: Logger) -> None:
+    allowlist = _allowlist_path(home)
+    records = _load_allowlist(allowlist)
+    cpath = str(contract_file.resolve())
+    chash = contract_content_hash(contract_file)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    records = [r for r in records if r.get("file") != cpath]
+    records.append({"file": cpath, "hash": chash, "trusted_at": now})
+    _save_allowlist(allowlist, records, dry_run, logger)
+
+
+def untrust_contract(home: Path, contract_file: Path, dry_run: bool, logger: Logger) -> bool:
+    allowlist = _allowlist_path(home)
+    records = _load_allowlist(allowlist)
+    cpath = str(contract_file.resolve())
+    new_records = [r for r in records if r.get("file") != cpath]
+    changed = len(new_records) != len(records)
+    if changed:
+        _save_allowlist(allowlist, new_records, dry_run, logger)
+    return changed
+
+
+def is_contract_trusted(home: Path, contract_file: Path) -> bool:
+    allowlist = _allowlist_path(home)
+    records = _load_allowlist(allowlist)
+    cpath = str(contract_file.resolve())
+    current_hash = contract_content_hash(contract_file)
+    for r in records:
+        if r.get("file") == cpath and r.get("hash") == current_hash:
+            return True
+    return False
+
+
+def build_runtime_plan(contract: ProjectContract, logger: Logger) -> RuntimePlan:
+    env: Dict[str, str] = {"SWITCH_ENV_PROJECT_ROOT": str(contract.project_root)}
+    commands: List[str] = []
+    vals = contract.values
+
+    py_ver = vals.get("python")
+    if py_ver:
+        commands.append(f'if command -v pyenv >/dev/null 2>&1; then pyenv shell {shlex_quote(py_ver)}; fi')
+    node_ver = vals.get("node")
+    if node_ver:
+        commands.append('export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"')
+        commands.append('[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"')
+        commands.append(f'if command -v nvm >/dev/null 2>&1; then nvm use {shlex_quote(node_ver)} >/dev/null; fi')
+    env_file = vals.get("env_file")
+    if env_file:
+        ef = contract.project_root / env_file
+        commands.append(f'if [ -f {shlex_quote(str(ef))} ]; then set -a; . {shlex_quote(str(ef))}; set +a; fi')
+    pnpm_ver = vals.get("pnpm")
+    if pnpm_ver:
+        # v1: 先记录提示，不强制安装/切换
+        commands.append(f'export SWITCH_ENV_TARGET_PNPM={shlex_quote(pnpm_ver)}')
+    post_activate = vals.get("post_activate")
+    if post_activate:
+        logger.warn("v1 不执行 post_activate，已忽略（将于 v2 受控支持）。")
+
+    return RuntimePlan(
+        action="apply",
+        env=env,
+        commands=commands,
+        meta={"project_root": str(contract.project_root), "contract": str(contract.file_path), "mode": "apply"},
+    )
+
+
+def render_shell_plan(plan: RuntimePlan) -> str:
+    lines: List[str] = []
+    for k, v in plan.env.items():
+        lines.append(f"export {k}={shlex_quote(v)}")
+    lines.extend(plan.commands)
+    return "\n".join(lines)
+
+
+def plan_to_json(plan: RuntimePlan) -> str:
+    payload = {
+        "action": plan.action,
+        "env": plan.env,
+        "commands": plan.commands,
+        "meta": plan.meta,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def plan_from_json(text: str) -> RuntimePlan:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SwitchEnvError(f"RuntimePlan JSON 解析失败: {e}") from e
+    if not isinstance(data, dict):
+        raise SwitchEnvError("RuntimePlan JSON 必须是对象。")
+
+    action = data.get("action")
+    env = data.get("env")
+    commands = data.get("commands")
+    meta = data.get("meta")
+    if not isinstance(action, str):
+        raise SwitchEnvError("RuntimePlan.action 必须是字符串。")
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        raise SwitchEnvError("RuntimePlan.env 必须是字符串字典。")
+    if not isinstance(commands, list) or not all(isinstance(x, str) for x in commands):
+        raise SwitchEnvError("RuntimePlan.commands 必须是字符串数组。")
+    if not isinstance(meta, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in meta.items()):
+        raise SwitchEnvError("RuntimePlan.meta 必须是字符串字典。")
+
+    return RuntimePlan(action=action, env=env, commands=commands, meta=meta)
+
+
+def plan_json_to_shell(text: str) -> str:
+    plan = plan_from_json(text)
+    return render_shell_plan(plan)
+
+
+def build_noop_plan(meta: Dict[str, str]) -> RuntimePlan:
+    merged_meta = {"mode": "noop"}
+    merged_meta.update(meta)
+    return RuntimePlan(action="noop", env={}, commands=[], meta=merged_meta)
 
 
 class Command(ABC):
@@ -1384,6 +1581,98 @@ class CleanCommand(Command):
         return 0
 
 
+class ResolveCommand(Command):
+    name = "resolve"
+    help = "向上查找当前目录生效的 .switch-env 路径。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        cf = resolve_contract_file(ctx.cwd)
+        if not cf:
+            ctx.log.info("未找到 .switch-env")
+            return 1
+        console.print(str(cf))
+        return 0
+
+
+class TrustCommand(Command):
+    name = "trust"
+    help = "信任当前（或指定）.switch-env 契约文件。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        target = Path(args.path).expanduser().resolve() if args.path else resolve_contract_file(ctx.cwd)
+        if not target:
+            raise SwitchEnvError("当前目录及父目录未找到 .switch-env")
+        if target.is_dir():
+            target = target / CONTRACT_FILENAME
+        if not target.exists():
+            raise SwitchEnvError(f"契约文件不存在: {target}")
+        parse_contract(target)  # strict validate first
+        trust_contract(ctx.home, target, ctx.shell.dry_run, ctx.log)
+        ctx.log.success(f"已信任: {target}")
+        return 0
+
+
+class UntrustCommand(Command):
+    name = "untrust"
+    help = "取消信任当前（或指定）.switch-env 契约文件。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        target = Path(args.path).expanduser().resolve() if args.path else resolve_contract_file(ctx.cwd)
+        if not target:
+            raise SwitchEnvError("当前目录及父目录未找到 .switch-env")
+        if target.is_dir():
+            target = target / CONTRACT_FILENAME
+        changed = untrust_contract(ctx.home, target, ctx.shell.dry_run, ctx.log)
+        if changed:
+            ctx.log.success(f"已取消信任: {target}")
+        else:
+            ctx.log.info(f"未发现信任记录: {target}")
+        return 0
+
+
+class AutoCommand(Command):
+    name = "auto"
+    help = "解析并自动应用当前项目 .switch-env 契约。"
+
+    def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
+        want_shell = bool(getattr(args, "shell", False))
+        want_json = bool(getattr(args, "json", False))
+        if want_shell and want_json:
+            raise SwitchEnvError("`auto` 不能同时使用 --shell 与 --json。")
+
+        cf = resolve_contract_file(ctx.cwd)
+        if not cf:
+            if want_json:
+                print(plan_to_json(build_noop_plan({"reason": "no_contract", "cwd": str(ctx.cwd)})))
+            return 0
+        if not is_contract_trusted(ctx.home, cf):
+            if want_shell:
+                print(f"WARN: 未授权项目契约: {cf}", file=sys.stderr)
+                print("INFO: 请执行 `switch-env trust` 后再自动切换。", file=sys.stderr)
+            elif want_json:
+                print(plan_to_json(build_noop_plan({"reason": "untrusted_contract", "contract": str(cf)})))
+            else:
+                ctx.log.warn(f"未授权项目契约: {cf}")
+                ctx.log.info("请执行 `switch-env trust` 后再自动切换。")
+            return 0
+        contract = parse_contract(cf)
+        plan = build_runtime_plan(contract, ctx.log)
+        plan_json = plan_to_json(plan)
+        if want_json:
+            print(plan_json)
+            return 0
+        if want_shell:
+            out = plan_json_to_shell(plan_json)
+            if out.strip():
+                print(out)
+            return 0
+        ctx.log.success(f"已解析契约: {contract.file_path}")
+        ctx.log.info(f"project_root={contract.project_root}")
+        for k, v in contract.values.items():
+            ctx.log.info(f"{k}={v}")
+        return 0
+
+
 class RepairCommand(Command):
     name = "repair"
     help = "修复 switch-env 安装态异常（meta/shebang 等）。"
@@ -1607,6 +1896,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_clean.add_argument("-n", "--name", default=DEFAULT_VENV_NAME)
     p_clean.add_argument("-c", "--cache-only", action="store_true")
 
+    # resolve
+    sub.add_parser("resolve", help=ResolveCommand.help)
+
+    # trust / untrust
+    p_trust = sub.add_parser("trust", help=TrustCommand.help)
+    p_trust.add_argument("path", nargs="?", help="可选：.switch-env 文件路径或项目目录")
+    p_untrust = sub.add_parser("untrust", help=UntrustCommand.help)
+    p_untrust.add_argument("path", nargs="?", help="可选：.switch-env 文件路径或项目目录")
+
+    # auto
+    p_auto = sub.add_parser("auto", help=AutoCommand.help)
+    p_auto.add_argument("--shell", action="store_true", help="输出 shell 可执行命令（供插件 eval）")
+    p_auto.add_argument("--json", action="store_true", help="输出结构化 RuntimePlan JSON（供审计/调试）")
+
     # repair
     sub.add_parser("repair", help=RepairCommand.help)
 
@@ -1629,6 +1932,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         c.name: c for c in [
             UseCommand(), StatusCommand(), DoctorCommand(), ListCommand(),
             BootstrapCommand(), DeactivateCommand(), InitCommand(), CleanCommand(),
+            ResolveCommand(), TrustCommand(), UntrustCommand(), AutoCommand(),
             RepairCommand(), UpgradeCommand(),
             HookCommand(),
         ]
