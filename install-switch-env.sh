@@ -15,6 +15,8 @@ set -euo pipefail
 # 非交互/静默控制
 AUTO_YES="${AUTO_YES:-0}"   # 1=自动确认
 QUIET="${QUIET:-0}"         # 1=减少输出
+FORCE="${FORCE:-0}"         # 1=检测到同名冲突时允许覆盖
+DEBUG_INSTALL_MODE="${DEBUG_INSTALL_MODE:-${SWITCH_ENV_DEBUG:-0}}"  # 1=输出安装模式评分细节（兼容统一开关）
 
 # ─── 全局配置 ─────────────────────────────────────────────────────
 readonly VENV_DIR="$HOME/.venv-tools"
@@ -26,6 +28,8 @@ readonly SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PAYLOAD_MARKER='##__SWITCH_ENV_PAYLOAD_BELOW__##'
 readonly SWITCH_ENV_SOURCE_URL="${SWITCH_ENV_SOURCE_URL:-https://github.com/ichichuang/switch-env}"
+readonly SWITCH_ENV_META_DIR="$HOME/.switch-env"
+readonly SWITCH_ENV_META_FILE="$SWITCH_ENV_META_DIR/meta"
 
 # ─── 颜色与符号 ──────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -160,6 +164,109 @@ cleanup_payload() {
   [[ $PAYLOAD_IS_TEMP -eq 1 && -n "$PAYLOAD_DIR" ]] && rm -rf "$PAYLOAD_DIR"
 }
 
+# ─── 安装模式识别（极简严格版）───────────────────────────────────
+# 返回值:
+#   fresh    未检测到已安装文件
+#   update   确认为 switch-env 官方安装
+#   conflict 检测到同名但无法确认是官方安装
+_grep_q() {
+  local pattern="$1" file="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg -F -q "$pattern" "$file" 2>/dev/null
+  else
+    grep -F -q "$pattern" "$file" 2>/dev/null
+  fi
+}
+
+_debug_install_mode() {
+  [[ "$DEBUG_INSTALL_MODE" == "1" && "$QUIET" != "1" ]] || return 0
+  printf "${CYAN}[debug]${NC} %s\n" "$*" >&2
+}
+
+is_our_switch_env_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  _grep_q 'switch-env: 统一的多运行时环境自动化引擎。' "$f" || return 1
+  _grep_q '__SWITCH_ENV_CMD__' "$f" || return 1
+  return 0
+}
+
+has_version_marker() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  _grep_q '__SWITCH_ENV_VERSION__' "$f"
+}
+
+is_our_plugin_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  _grep_q '_switch_env_chpwd' "$f" || return 1
+  _grep_q 'autoload -U add-zsh-hook' "$f" || return 1
+  _grep_q 'add-zsh-hook chpwd _switch_env_chpwd' "$f" || return 1
+  _grep_q 'switch-env.plugin.zsh' "$f" || return 1
+  return 0
+}
+
+is_our_shebang() {
+  local f="$1" first_line=""
+  [[ -f "$f" ]] || return 1
+  [[ -n "${VENV_DIR:-}" ]] || return 1
+  IFS= read -r first_line < "$f" || return 1
+  [[ "$first_line" == "#!${VENV_DIR}/bin/python"* ]]
+}
+
+has_our_meta() {
+  [[ -f "$SWITCH_ENV_META_FILE" ]] || return 1
+  _grep_q 'installed_by=switch-env-installer' "$SWITCH_ENV_META_FILE" || return 1
+  _grep_q 'repo_url=https://github.com/ichichuang/switch-env' "$SWITCH_ENV_META_FILE" || return 1
+  # forward-compatible
+  _grep_q 'meta_version=' "$SWITCH_ENV_META_FILE" || return 1
+  _grep_q 'signature=switch-env' "$SWITCH_ENV_META_FILE" || return 1
+  return 0
+}
+
+detect_install_mode() {
+  local target_bin="$BIN_DIR/switch-env"
+  local target_plugin="$BIN_DIR/switch-env.plugin.zsh"
+  local score=0
+
+  if [[ ! -f "$target_bin" && ! -f "$target_plugin" && ! -f "$SWITCH_ENV_META_FILE" ]]; then
+    _debug_install_mode "fresh: no bin/plugin/meta found"
+    echo "fresh"
+    return 0
+  fi
+
+  if has_our_meta; then
+    ((score+=3))
+    _debug_install_mode "meta +3"
+  fi
+  if is_our_switch_env_file "$target_bin"; then
+    ((score+=2))
+    _debug_install_mode "bin +2"
+  fi
+  if is_our_plugin_file "$target_plugin"; then
+    ((score+=2))
+    _debug_install_mode "plugin +2"
+  fi
+  if is_our_shebang "$target_bin"; then
+    ((score+=1))
+    _debug_install_mode "shebang +1"
+  fi
+  if has_version_marker "$target_bin"; then
+    ((score+=1))
+    _debug_install_mode "version +1"
+  fi
+  _debug_install_mode "total=${score}"
+
+  if (( score >= 4 )); then
+    echo "update"
+    return 0
+  else
+    echo "conflict"
+    return 0
+  fi
+}
+
 # ─── 安装流程 ─────────────────────────────────────────────────────
 do_install() {
   echo ""
@@ -177,6 +284,32 @@ do_install() {
   echo "  3. 安装 switch-env 到 ~/bin/"
   echo "  4. 配置 ~/.zshrc 自动加载"
   echo "  5. 验证安装"
+  echo ""
+
+  local install_mode
+  install_mode="$(detect_install_mode)"
+  case "$install_mode" in
+    fresh)
+      ok "[安装模式] 全新安装"
+      ;;
+    update)
+      warn "[安装模式] 更新已有 switch-env"
+      ;;
+    conflict)
+      fail "[安装模式] 检测到同名冲突"
+      [[ -f "$BIN_DIR/switch-env" ]] && echo "  - $BIN_DIR/switch-env"
+      [[ -f "$BIN_DIR/switch-env.plugin.zsh" ]] && echo "  - $BIN_DIR/switch-env.plugin.zsh"
+      echo ""
+      echo "检测到同名文件，但无法确认是 switch-env 官方安装。"
+      echo "为保护你的环境，安装已默认终止。"
+      echo "如需强制覆盖，请使用：FORCE=1 <安装命令>"
+      [[ "$FORCE" == "1" ]] || fatal "同名冲突，已终止安装"
+      warn "FORCE=1 已启用，将继续覆盖安装。"
+      ;;
+    *)
+      fatal "未知安装模式: $install_mode"
+      ;;
+  esac
   echo ""
 
   if [[ "$AUTO_YES" == "1" ]]; then
@@ -293,6 +426,18 @@ do_install() {
     cp "$PAYLOAD_DIR/switch-env.md" "$BIN_DIR/switch-env.md"
     ok "switch-env.md → $BIN_DIR/switch-env.md"
   fi
+
+  # 写入安装元数据（用于后续 update/conflict 判定）
+  mkdir -p "$SWITCH_ENV_META_DIR"
+  {
+    echo "installed_by=switch-env-installer"
+    echo "repo_url=https://github.com/ichichuang/switch-env"
+    echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "meta_version=1"
+    echo "signature=switch-env-official"
+    echo "version=${VERSION:-unknown}"
+  } > "$SWITCH_ENV_META_FILE"
+  ok "安装元数据已写入: $SWITCH_ENV_META_FILE"
 
   echo ""
 
@@ -462,6 +607,15 @@ do_uninstall() {
     ok "已删除 $VENV_DIR"
   fi
 
+  # 删除安装元数据
+  if [[ -f "$SWITCH_ENV_META_FILE" ]]; then
+    rm -f "$SWITCH_ENV_META_FILE"
+    ok "已删除 $SWITCH_ENV_META_FILE"
+  fi
+  if [[ -d "$SWITCH_ENV_META_DIR" ]]; then
+    rmdir "$SWITCH_ENV_META_DIR" 2>/dev/null || true
+  fi
+
   # 清理 zshrc
   if [[ -f "$ZSHRC" ]]; then
     local backup="${ZSHRC}.pre-uninstall.$(date +%Y%m%d%H%M%S)"
@@ -505,7 +659,7 @@ case "${1:-}" in
     echo "  --build [out] 构建单文件安装包"
     echo "  --uninstall   卸载 switch-env"
     echo "  --help        显示此帮助"
-    echo "  环境变量: AUTO_YES=1 QUIET=1"
+    echo "  环境变量: AUTO_YES=1 QUIET=1 FORCE=1 DEBUG_INSTALL_MODE=1 SWITCH_ENV_DEBUG=1"
     ;;
   *)
     do_install
