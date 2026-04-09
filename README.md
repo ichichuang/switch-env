@@ -27,7 +27,8 @@ curl -fsSL https://github.com/ichichuang/switch-env/releases/latest/download/swi
 ### 方式二：双击安装（普通用户，仅需一个文件）
 
 1. 从 Release 页面下载 `switch-env-installer.command`
-2. 双击该文件，脚本会自动下载最新 `switch-env-installer.sh` 并执行安装
+2. 双击该文件，脚本会自动下载最新 `switch-env-installer.sh` 并执行安装（默认 `AUTO_YES=1`）
+3. 若检测到本地同名冲突（非官方 `switch-env`），安装器会默认中止以保护你的环境
 
 若双击无法运行，可在终端执行：
 
@@ -41,6 +42,22 @@ chmod +x switch-env-installer.command
 - 若系统提示“无法打开/来源不明”，请使用以下方式放行：
   - Finder 中右键 `switch-env-installer.command` -> 打开
   - 或系统设置 -> 隐私与安全性 -> 允许执行
+
+### 冲突保护机制（默认开启）
+
+- 安装器会自动识别 `fresh / update / conflict` 三种状态
+- `conflict` 时默认终止，避免覆盖未知同名工具
+- 仅在你确认覆盖时使用：
+
+```bash
+FORCE=1 curl -fsSL https://github.com/ichichuang/switch-env/releases/latest/download/switch-env-installer.sh | AUTO_YES=1 bash
+```
+
+需要排查安装模式判定时，可开启调试输出：
+
+```bash
+DEBUG_INSTALL_MODE=1 QUIET=0 bash ./install-switch-env.sh
+```
 
 安装后请执行：
 
