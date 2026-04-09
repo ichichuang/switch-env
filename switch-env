@@ -661,16 +661,18 @@ class ResolvedPythonEnv:
     manager: str                       # pyenv | conda
     python_version: Optional[str]
     env_ref: str                       # pyenv: version string; conda: env name
+    source_file: str = "project markers"  # 记录来源文件（如 .python-version / pyproject.toml）
 
 
 @dataclass(frozen=True)
 class ResolvedNodeEnv:
     raw_version: str                   # 原始请求字符串 (如 "18", "v22.14.0")
     parsed: SemVer
+    source_file: str = "project markers"  # 记录来源文件（如 .nvmrc / .node-version）
 
 
 def _parse_switch_py_env_file(path: Path) -> Optional[ResolvedPythonEnv]:
-    if not path.exists():
+    if not path.exists() or not path.is_file():
         return None
     manager = version = env_name = None
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -682,9 +684,9 @@ def _parse_switch_py_env_file(path: Path) -> Optional[ResolvedPythonEnv]:
         elif line.startswith("env_name:"):
             env_name = line.split(":", 1)[1].strip()
     if manager == "pyenv" and version:
-        return ResolvedPythonEnv(manager="pyenv", python_version=version, env_ref=version)
+        return ResolvedPythonEnv(manager="pyenv", python_version=version, env_ref=version, source_file=path.name)
     if manager == "conda" and env_name:
-        return ResolvedPythonEnv(manager="conda", python_version=None, env_ref=env_name)
+        return ResolvedPythonEnv(manager="conda", python_version=None, env_ref=env_name, source_file=path.name)
     return None
 
 
@@ -753,21 +755,21 @@ class EnvResolver:
         if py:
             mgr = self._default_py_manager(spec)
             ref = py if mgr == "pyenv" else root.name
-            return ResolvedPythonEnv(manager=mgr, python_version=py, env_ref=ref)
+            return ResolvedPythonEnv(manager=mgr, python_version=py, env_ref=ref, source_file="pyproject.toml")
 
         # 3) .python-version
         pv = _parse_python_version_file(root / ".python-version")
         if pv:
-            return ResolvedPythonEnv(manager="pyenv", python_version=pv, env_ref=pv)
+            return ResolvedPythonEnv(manager="pyenv", python_version=pv, env_ref=pv, source_file=".python-version")
 
         # 4) environment.yml (conda 项目)
         if spec.kind == "conda":
             env_name = _parse_conda_env_name(spec.environment_yml) if spec.environment_yml else root.name
-            return ResolvedPythonEnv(manager="conda", python_version=None, env_ref=env_name or root.name)
+            return ResolvedPythonEnv(manager="conda", python_version=None, env_ref=env_name or root.name, source_file="environment.yml")
 
         # 5) requirements.txt 存在则视为 pip 项目
         if spec.kind == "pip":
-            return ResolvedPythonEnv(manager="pyenv", python_version=FALLBACK_PYTHON, env_ref=FALLBACK_PYTHON)
+            return ResolvedPythonEnv(manager="pyenv", python_version=FALLBACK_PYTHON, env_ref=FALLBACK_PYTHON, source_file="requirements.txt")
 
         # 无 Python 标识 → 不激活
         return None
@@ -780,8 +782,34 @@ class EnvResolver:
                 if raw:
                     sv = SemVer.parse(raw)
                     if sv:
-                        return ResolvedNodeEnv(raw_version=raw, parsed=sv)
+                        return ResolvedNodeEnv(raw_version=raw, parsed=sv, source_file=p.name)
         return None
+
+
+def resolve_project_root_by_markers(cwd: Path) -> Optional[Path]:
+    """向上查找可能的项目根目录（基于常见标识文件），用于 auto 的无契约降级。"""
+    markers = (
+        ".python-version",
+        ".nvmrc",
+        ".node-version",
+        "pyproject.toml",
+        "requirements.txt",
+        "environment.yml",
+        "package.json",
+    )
+    cur = cwd.resolve()
+    home = Path.home().resolve()
+    while True:
+        for m in markers:
+            p = cur / m
+            if p.exists() and p.is_file():
+                return cur
+        # 避免误把 $HOME 当作项目根（例如存在 ~/.switch-env 目录等）
+        if cur == home:
+            return None
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
 
     def _default_py_manager(self, spec: ProjectSpec) -> str:
         if self.cfg.py_manager in ("pyenv", "conda"):
@@ -1798,7 +1826,7 @@ class UntrustCommand(Command):
 
 class AutoCommand(Command):
     name = "auto"
-    help = "解析并自动应用当前项目 .switch-env 契约。"
+    help = "供 Shell 插件调用的无感自动切换逻辑（支持契约与传统文件降级）。"
 
     def run(self, ctx: AppContext, args: argparse.Namespace) -> int:
         want_shell = bool(getattr(args, "shell", False))
@@ -1807,47 +1835,123 @@ class AutoCommand(Command):
         if want_shell and want_json:
             raise SwitchEnvError("`auto` 不能同时使用 --shell 与 --json。")
 
+        shell_cmds: List[str] = []
+        notify_msgs: List[str] = []
+        source_markers: List[str] = []
+
+        # ── Layer 2：优先契约模式（.switch-env + trust） ─────────────────────
         cf = resolve_contract_file(ctx.cwd)
-        if not cf:
-            if want_json:
-                print(plan_to_json(build_noop_plan({"reason": "no_contract", "cwd": str(ctx.cwd)})))
-            return 0
-        if not is_contract_trusted(ctx.home, cf):
-            if want_shell:
-                print(f"WARN: 未授权项目契约: {cf}", file=sys.stderr)
-                print("INFO: 请执行 `switch-env trust` 后再自动切换。", file=sys.stderr)
-            elif want_json:
-                print(plan_to_json(build_noop_plan({"reason": "untrusted_contract", "contract": str(cf)})))
-            else:
+        if cf:
+            if not is_contract_trusted(ctx.home, cf):
+                # 未信任：保持安全 no-op。notify 不提示（仅在发生切换/激活时提示）
+                if want_shell:
+                    return 0
+                if want_json:
+                    print(plan_to_json(build_noop_plan({"reason": "untrusted_contract", "contract": str(cf)})))
+                    return 0
                 ctx.log.warn(f"未授权项目契约: {cf}")
                 ctx.log.info("请执行 `switch-env trust` 后再自动切换。")
+                return 0
+
+            contract = parse_contract(cf)
+            plan = build_runtime_plan(contract, ctx.log)
+            plan_json = plan_to_json(plan)
+            if want_json:
+                print(plan_json)
+                return 0
+            if want_shell:
+                out = plan_json_to_shell(plan_json)
+                if out.strip():
+                    print(out)
+                if want_notify and plan.action == "apply" and (plan.commands or plan.env):
+                    parts: List[str] = []
+                    if "python" in contract.values:
+                        parts.append(f"Python={contract.values.get('python')}")
+                    if "node" in contract.values:
+                        parts.append(f"Node={contract.values.get('node')}")
+                    if "env_file" in contract.values:
+                        parts.append(f"env={contract.values.get('env_file')}")
+                    proj = contract.project_root.name
+                    msg = " ".join(parts) if parts else "activated"
+                    console_err.print(f"[green]✓[/green] switch-env: {msg} (from .switch-env, project={proj})")
+                return 0
+
+            ctx.log.success(f"已解析契约: {contract.file_path}")
+            ctx.log.info(f"project_root={contract.project_root}")
+            for k, v in contract.values.items():
+                ctx.log.info(f"{k}={v}")
             return 0
-        contract = parse_contract(cf)
-        plan = build_runtime_plan(contract, ctx.log)
-        plan_json = plan_to_json(plan)
+
+        # ── Layer 1：无契约时降级到传统项目标识（.nvmrc/.python-version/等） ──
+        root = resolve_project_root_by_markers(ctx.cwd)
+        if not root:
+            if want_json:
+                print(plan_to_json(build_noop_plan({"reason": "no_markers", "cwd": str(ctx.cwd)})))
+            return 0
+
+        spec = detect_project(root)
+        py_resolved = ctx.resolver.resolve_python(spec)
+        node_resolved = ctx.resolver.resolve_node(spec)
+
+        if not py_resolved and not node_resolved:
+            if want_json:
+                print(plan_to_json(build_noop_plan({"reason": "no_runtime_markers", "cwd": str(ctx.cwd)})))
+            return 0
+
+        # 统一导出 project root（供 shell 环境可见）
+        shell_cmds.append(f"export SWITCH_ENV_PROJECT_ROOT={shlex_quote(str(root))}")
+
+        # 1) Python（auto 模式不做安装/写文件，只做激活）
+        if py_resolved:
+            mgr = ctx.py_managers.get(py_resolved.manager)
+            if mgr and mgr.is_available():
+                venv_path = root / DEFAULT_VENV_NAME if (root / DEFAULT_VENV_NAME).exists() else None
+                plan = mgr.activation_plan(root, venv_path, py_resolved.env_ref)
+                if plan.kind == "shell_cmd" and plan.shell_cmds:
+                    shell_cmds.extend(plan.shell_cmds)
+                    notify_msgs.append(f"Python={py_resolved.python_version or py_resolved.env_ref}")
+                    source_markers.append(py_resolved.source_file)
+
+        # 2) Node（仅在不匹配时切换）
+        if node_resolved:
+            nmgr = ctx.node_managers.get(ctx.cfg.node_manager)
+            if nmgr and nmgr.is_available():
+                current = nmgr.current_version()
+                if not current or not node_resolved.parsed.matches(current):
+                    best = nmgr._find_best_match(node_resolved.parsed) if isinstance(nmgr, NvmManager) else None
+                    use_ver = f"v{best}" if best and best.patch is not None else node_resolved.raw_version
+                    plan = nmgr.switch_plan(use_ver)
+                    if plan.kind == "shell_cmd" and plan.shell_cmds:
+                        shell_cmds.extend(plan.shell_cmds)
+                        notify_msgs.append(f"Node={use_ver}")
+                        source_markers.append(node_resolved.source_file)
+
         if want_json:
-            print(plan_json)
+            # 输出简化的 RuntimePlan JSON（与 auto 契约模式保持结构一致）
+            plan = RuntimePlan(
+                action="apply" if notify_msgs else "noop",
+                env={},
+                commands=shell_cmds[1:],  # 不重复导出行到 env；保持 commands 为主要载体
+                meta={"mode": "fallback", "project_root": str(root)},
+            )
+            print(plan_to_json(plan))
             return 0
+
         if want_shell:
-            out = plan_json_to_shell(plan_json)
+            # 仅输出纯 shell（stdout），不混入日志
+            out = "\n".join(shell_cmds)
             if out.strip():
                 print(out)
-            if want_notify and plan.action == "apply" and (plan.commands or plan.env):
-                parts: List[str] = []
-                if "python" in contract.values:
-                    parts.append(f"Python={contract.values.get('python')}")
-                if "node" in contract.values:
-                    parts.append(f"Node={contract.values.get('node')}")
-                if "env_file" in contract.values:
-                    parts.append(f"env={contract.values.get('env_file')}")
-                proj = contract.project_root.name
-                msg = " ".join(parts) if parts else "activated"
-                console_err.print(f"[green]✓[/green] switch-env: {msg} (project={proj})")
+            if want_notify and notify_msgs:
+                unique_sources = ", ".join(sorted(set(source_markers))) if source_markers else "project markers"
+                msg = " ".join(notify_msgs)
+                console_err.print(f"[green]✓[/green] switch-env: {msg} (from {unique_sources})")
             return 0
-        ctx.log.success(f"已解析契约: {contract.file_path}")
-        ctx.log.info(f"project_root={contract.project_root}")
-        for k, v in contract.values.items():
-            ctx.log.info(f"{k}={v}")
+
+        # 非 shell 模式：人类可读（尽量简洁）
+        ctx.log.success(f"auto (fallback): project_root={root}")
+        if notify_msgs:
+            ctx.log.info(" ".join(notify_msgs))
         return 0
 
 
